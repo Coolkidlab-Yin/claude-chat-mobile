@@ -153,6 +153,43 @@ A few constants near the top of `server.py` are also worth knowing: `PORT` (8899
 - **Sending a message** shells out to `claude -p --resume <session-id> --output-format stream-json --verbose <permission-flags>` and streams the resulting JSON events back to the browser over Server-Sent Events (`GET /api/run/{run_id}/events`), so the UI updates live as Claude works.
 - **Network exposure:** the server only binds to `127.0.0.1` plus (if detected) your machine's Tailscale IPv4 address — nothing else. It is not reachable from your regular home Wi-Fi/LAN or the public internet unless you explicitly change `bind_hosts()`.
 
+### Question cards (AskUserQuestion on your phone)
+
+`claude -p` — the mode this app drives sessions with — does **not** expose Claude Code's
+built-in `AskUserQuestion` tool at all, so out of the box the model literally cannot ask
+you a multiple-choice question and will just guess. This app fills the gap with a
+question channel of its own:
+
+1. Every Claude run is spawned with `--mcp-config ask-mcp-config.json`, which loads
+   `askuser-mcp.js` — a tiny stdio MCP server exposing one tool, `mcp__chat__ask_user`
+   (auto-allowed via `--allowedTools`, and a `--append-system-prompt` note tells the
+   model to use it instead of `AskUserQuestion`).
+2. When the model calls it, the MCP server POSTs the questions to `/api/ask` and the
+   phone renders a tappable option card (single/multi select, free-text field, and a
+   skip button) right in the chat.
+3. Your tap is returned to the model as the tool result; if you skip or don't answer
+   within ~9 minutes, the model is told to proceed with a sensible default and say what
+   it assumed.
+
+No setup needed — `ask-mcp-config.json` is regenerated on server start with your
+machine's `node` path, and the channel only exists for runs this server spawns (the
+desktop app and plain CLI are untouched).
+
+Optional belt-and-suspenders: `hooks/askuser-bridge.js` is a `PreToolUse` hook that
+bridges the *built-in* `AskUserQuestion` tool the same way, should a future Claude Code
+version add it to `-p` mode. It refuses to run unless the `CLAUDE_CHAT_RUN_ID`
+environment variable is set (only server-spawned runs have it), so registering it
+globally is safe. To register, add to `hooks.PreToolUse` in `~/.claude/settings.json`:
+
+```json
+{
+  "matcher": "AskUserQuestion",
+  "hooks": [
+    { "type": "command", "command": "node \"/path/to/hooks/askuser-bridge.js\"", "timeout": 600 }
+  ]
+}
+```
+
 ### Troubleshooting
 
 - **"claude" can't be found / server won't start a run:** the executable lookup logic lives in `resolve_claude_cmd()` near the top of `server.py`. It tries, in order: the Claude Code CLI's own `claude.exe`, then `node` + `cli.js` directly, then falls back to `claude.cmd` via `cmd.exe`. If a Claude Code / npm update moves things, start here.

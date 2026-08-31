@@ -115,6 +115,36 @@ def resolve_claude_cmd():
 
 CLAUDE_ARGV = resolve_claude_cmd()
 
+# ---------- AskUserQuestion 手機橋接 ----------
+# claude -p 的工具清單裡「沒有」內建 AskUserQuestion，模型根本無從問使用者選擇題。
+# 解法：每個手機 run 掛一個自製 MCP 工具 mcp__chat__ask_user 當提問通道——
+# 模型呼叫它 → askuser-mcp.js POST /api/ask → 手機顯示選項卡 → 答案當工具結果回去。
+ASK_MCP_JS = BASE / "askuser-mcp.js"
+ASK_MCP_CONFIG = BASE / "ask-mcp-config.json"
+ASK_SYSTEM_PROMPT = (
+    "你正在使用者的手機聊天介面（claude-chat）裡執行。需要問使用者選擇題"
+    "（釐清模糊需求、做決定、在多個做法中挑一個）時，呼叫 mcp__chat__ask_user 工具："
+    "手機會顯示可點選的選項卡，使用者的選擇會當成工具結果回傳給你。"
+    "不要呼叫 AskUserQuestion（這個環境沒有那個工具），"
+    "也不要用純文字列出選項乾等回覆。"
+)
+
+
+def _write_ask_mcp_config():
+    """把 MCP 設定檔落地（node 路徑因機器而異，啟動時現算）。"""
+    if not ASK_MCP_JS.exists():
+        return False
+    node = shutil.which("node")
+    if not node:
+        pf = Path(r"C:\Program Files\nodejs\node.exe")
+        node = str(pf) if pf.exists() else "node"
+    cfg = {"mcpServers": {"chat": {"command": node, "args": [str(ASK_MCP_JS)]}}}
+    ASK_MCP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
+
+
+ASK_MCP_READY = _write_ask_mcp_config()
+
 CODEX_EXE = shutil.which("codex.cmd") or str(HOME / "AppData" / "Roaming" / "npm" / "codex.cmd")
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 API_CHATS = BASE / "api-chats"
@@ -1122,18 +1152,33 @@ async def run_claude(run, text, mode, extra_args=()):
     argv = CLAUDE_ARGV + ["-p", "--output-format", "stream-json", "--verbose"]
     # 送訊息的入口已經擋過未知模式，這裡的預設值只是雙保險：退到最安全的那個
     argv += PERMISSION_FLAGS.get(mode, PERMISSION_FLAGS["plan"])
+    if ASK_MCP_READY:
+        # 提問通道要在任何權限模式下都免詢問（-p 沒有 UI，詢問等於直接被拒）
+        argv += [
+            "--mcp-config", str(ASK_MCP_CONFIG),
+            "--allowedTools", "mcp__chat__ask_user",
+            "--append-system-prompt", ASK_SYSTEM_PROMPT,
+        ]
     argv += list(extra_args)
     if run.sid:
         argv += ["--resume", run.sid]
     stderr_tail = ""
     got_done = False
     try:
+        # 讓 AskUserQuestion 橋接 hook 認得這是本 App 開的 run（hook 沒讀到這兩個
+        # 變數會直接放行，桌面與一般 CLI 完全不受影響）
+        child_env = dict(os.environ)
+        child_env["CLAUDE_CHAT_RUN_ID"] = run.id
+        child_env["CLAUDE_CHAT_PORT"] = str(PORT)
+        # ask_user 要等真人在手機上點選，工具呼叫逾時放寬到 10 分鐘
+        child_env["MCP_TOOL_TIMEOUT"] = "600000"
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=run.cwd,
+            env=child_env,
             limit=16 * 1024 * 1024,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
@@ -1595,6 +1640,69 @@ def usage(days: int = 7):
         "models": {m: pack(v) for m, v in
                    sorted(model_totals.items(), key=lambda kv: -kv[1][2])},
     }
+
+
+# ---------- AskUserQuestion 橋接 ----------
+# claude -p 沒有介面可以回答 AskUserQuestion，工具呼叫會直接失敗。
+# 橋接法：PreToolUse hook 攔下它 → POST 到這裡 → SSE 推給手機出選項卡 →
+# 使用者點選 → hook 長輪詢拿到答案 → 以 deny+reason 把選擇還給模型。
+
+ASKS = {}  # ask_id -> {"run_id", "questions", "answer", "created"}
+
+
+class AskBody(BaseModel):
+    run_id: str
+    tool_input: dict
+
+
+class AskAnswerBody(BaseModel):
+    answers: dict = {}
+    free_text: str = ""
+    skipped: bool = False
+
+
+@app.post("/api/ask")
+async def ask_open(body: AskBody):
+    run = RUNS.get(body.run_id)
+    if not run or run.done:
+        raise HTTPException(404, "這個工作已經結束")
+    ask_id = uuid.uuid4().hex[:12]
+    questions = body.tool_input.get("questions") or []
+    ASKS[ask_id] = {"run_id": body.run_id, "questions": questions,
+                    "answer": None, "created": time.time()}
+    await _emit(run, {"kind": "ask", "ask_id": ask_id, "questions": questions})
+    return {"ask_id": ask_id}
+
+
+@app.get("/api/ask/{ask_id}")
+async def ask_poll(ask_id: str):
+    """hook 的長輪詢端點：最多等 20 秒，拿到答案或先回 pending。"""
+    a = ASKS.get(ask_id)
+    if not a:
+        raise HTTPException(404, "沒有這筆提問")
+    for _ in range(40):
+        if a["answer"] is not None:
+            return {"answer": a["answer"]}
+        run = RUNS.get(a["run_id"])
+        if not run or run.done:
+            return {"answer": {"skipped": True, "reason": "run_ended"}}
+        await asyncio.sleep(0.5)
+    return {"pending": True}
+
+
+@app.post("/api/ask/{ask_id}/answer")
+async def ask_answer(ask_id: str, body: AskAnswerBody):
+    a = ASKS.get(ask_id)
+    if not a:
+        raise HTTPException(404, "沒有這筆提問")
+    if a["answer"] is not None:
+        return {"ok": True, "already": True}
+    a["answer"] = {"answers": body.answers, "free_text": body.free_text,
+                   "skipped": body.skipped}
+    run = RUNS.get(a["run_id"])
+    if run:
+        await _emit(run, {"kind": "ask_done", "ask_id": ask_id})
+    return {"ok": True}
 
 
 class ArchiveBody(BaseModel):

@@ -348,6 +348,50 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 .t-state.ok { color: var(--ok); } .t-state.bad { color: var(--bad); }
 
+/* AskUserQuestion 選項卡 */
+.ask-card {
+  align-self: flex-start; max-width: 92%; min-width: 0; width: 92%;
+  background: var(--ai-bub); border: 1px solid var(--accent);
+  border-radius: 16px; padding: 12px 14px;
+}
+.ask-card .ask-head { font-size: 12px; font-weight: 700; color: var(--accent); margin-bottom: 8px; }
+.ask-card .ask-tag {
+  display: inline-block; font-size: 10px; letter-spacing: .08em;
+  background: var(--accent); color: var(--cta-text);
+  border-radius: 4px; padding: 1px 7px; margin-bottom: 5px;
+}
+.ask-card .ask-question { font-size: 14.5px; font-weight: 600; margin-bottom: 8px; }
+.ask-card .ask-q { margin-bottom: 10px; }
+.ask-opt {
+  display: block; width: 100%; text-align: left; margin-bottom: 6px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 12px;
+  padding: 9px 12px; cursor: pointer; color: var(--text);
+}
+.ask-opt b { display: block; font-size: 14px; }
+.ask-opt span { display: block; font-size: 12px; color: var(--dim); line-height: 1.45; margin-top: 2px; }
+.ask-opt.on { border-color: var(--accent); background: var(--panel3); }
+.ask-multi-ok {
+  width: 100%; padding: 9px; border-radius: 12px; border: none;
+  background: var(--cta); color: var(--cta-text); font-weight: 600; cursor: pointer;
+}
+.ask-free { display: flex; gap: 6px; margin-top: 4px; }
+.ask-free input {
+  flex: 1; min-width: 0; border: 1px solid var(--line); background: var(--panel);
+  color: var(--text); border-radius: 10px; padding: 8px 11px; font-size: 14px; outline: none;
+}
+.ask-free .ask-send {
+  flex: 0 0 auto; padding: 8px 14px; border-radius: 10px; border: none;
+  background: var(--cta); color: var(--cta-text); cursor: pointer;
+}
+.ask-skip {
+  width: 100%; margin-top: 8px; padding: 7px; border-radius: 10px;
+  border: 1px dashed var(--line); background: none; color: var(--dim);
+  font-size: 12.5px; cursor: pointer;
+}
+.ask-card.done { opacity: .65; border-color: var(--line); }
+.ask-card.done .ask-opt.on { border-color: var(--accent); opacity: 1; }
+.ask-note { font-size: 12px; color: var(--dim); margin-top: 6px; }
+
 /* 摘要/系統膠囊 */
 .info-chip {
   align-self: center; font-size: 11.5px; color: var(--dim);

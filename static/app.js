@@ -625,6 +625,17 @@ function attachRun(runId, from, isReattach) {
       setCtx(it);
       return;
     }
+    if (it.kind === "ask") {
+      hideTyping();
+      renderAskCard(it);
+      showTyping();
+      scrollBottom();
+      return;
+    }
+    if (it.kind === "ask_done") {
+      lockAskCard(it.ask_id, null);
+      return;
+    }
     if (it.kind === "tool_ok") {
       const chip = toolChips[it.tool_use_id];
       if (chip) {
@@ -686,6 +697,98 @@ async function finishRun(doneEv) {
     setTimeout(() => { if (current && !activeRun) loadHistory().catch(() => {}); }, 400);
   }
   loadRooms(true);
+}
+
+/* ---------- AskUserQuestion 選項卡 ---------- */
+function renderAskCard(it) {
+  const card = document.createElement("div");
+  card.className = "msg ai ask-card";
+  card.dataset.askId = it.ask_id;
+  const picked = {};   // question -> Set(labels)
+
+  let html = '<div class="ask-head">🙋 它想問你</div>';
+  for (const q of it.questions || []) {
+    const multi = !!q.multiSelect;
+    html += '<div class="ask-q" data-q="' + esc(q.question) + '" data-multi="' + (multi ? 1 : 0) + '">';
+    if (q.header) html += '<div class="ask-tag">' + esc(q.header) + "</div>";
+    html += '<div class="ask-question">' + esc(q.question) + "</div>";
+    for (const o of q.options || []) {
+      html += '<button class="ask-opt" data-label="' + esc(o.label) + '">' +
+        '<b>' + esc(o.label) + "</b>" +
+        (o.description ? "<span>" + esc(o.description) + "</span>" : "") +
+        "</button>";
+    }
+    if (multi) html += '<button class="ask-multi-ok">就選這些</button>';
+    html += "</div>";
+  }
+  html += '<div class="ask-free"><input type="text" placeholder="或用打字回答…">' +
+    '<button class="ask-send">送出</button></div>' +
+    '<button class="ask-skip">跳過，讓它自己決定</button>';
+  card.innerHTML = html;
+
+  const submit = (answers, freeText, skipped) => {
+    api("/api/ask/" + it.ask_id + "/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: answers || {}, free_text: freeText || "", skipped: !!skipped }),
+    }).catch(() => {});
+    lockAskCard(it.ask_id, skipped ? "（已跳過）" : null);
+  };
+
+  card.querySelectorAll(".ask-q").forEach((qEl) => {
+    const qText = qEl.dataset.q;
+    const multi = qEl.dataset.multi === "1";
+    qEl.querySelectorAll(".ask-opt").forEach((btn) => {
+      btn.onclick = () => {
+        const label = btn.dataset.label;
+        if (multi) {
+          const set = picked[qText] = picked[qText] || new Set();
+          if (set.has(label)) { set.delete(label); btn.classList.remove("on"); }
+          else { set.add(label); btn.classList.add("on"); }
+          return;
+        }
+        picked[qText] = new Set([label]);
+        btn.classList.add("on");
+        // 單選題全部答完才送出
+        const allQ = [...card.querySelectorAll(".ask-q")];
+        if (allQ.every((x) => picked[x.dataset.q] && picked[x.dataset.q].size)) {
+          const answers = {};
+          for (const [k, v] of Object.entries(picked)) answers[k] = [...v].join("、");
+          submit(answers, "", false);
+        }
+      };
+    });
+  });
+  card.querySelectorAll(".ask-multi-ok").forEach((btn) => {
+    btn.onclick = () => {
+      const answers = {};
+      for (const [k, v] of Object.entries(picked)) answers[k] = [...v].join("、");
+      submit(answers, "", false);
+    };
+  });
+  card.querySelector(".ask-send").onclick = () => {
+    const v = card.querySelector(".ask-free input").value.trim();
+    if (!v) return;
+    const answers = {};
+    for (const [k, s] of Object.entries(picked)) answers[k] = [...s].join("、");
+    submit(answers, v, false);
+  };
+  card.querySelector(".ask-skip").onclick = () => submit({}, "", true);
+
+  msgsEl.appendChild(card);
+}
+
+function lockAskCard(askId, note) {
+  const card = msgsEl.querySelector('.ask-card[data-ask-id="' + askId + '"]');
+  if (!card || card.classList.contains("done")) return;
+  card.classList.add("done");
+  card.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
+  if (note) {
+    const n = document.createElement("div");
+    n.className = "ask-note";
+    n.textContent = note;
+    card.appendChild(n);
+  }
 }
 
 function sysNote(text, isErr) {
