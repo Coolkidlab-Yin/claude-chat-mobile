@@ -253,15 +253,21 @@ def _iter_tail_lines(path, max_bytes):
 
 
 def _head_info(path):
-    """讀檔頭：cwd、entrypoint、標題（第一句提問）。"""
-    info = {"cwd": None, "title": "", "entry": None}
+    """讀檔頭：cwd、entrypoint、標題、是否為 compact 後的世代。
+
+    標題優先用 `custom-title`（就是桌面 app 顯示的那個名字，寫在檔案第一行）。
+    退回「第一句提問」只在沒有 custom-title 時 —— 對 compact 後產生的檔，
+    第一句提問是使用者當下講的那句話，拿來當標題會變成滿滿的自言自語。
+    """
+    info = {"cwd": None, "title": "", "entry": None,
+            "custom_title": "", "compacted": False}
     try:
         with open(path, "rb") as f:
             data = f.read(HEAD_BYTES)
         lines = data.decode("utf-8", "replace").splitlines()
     except OSError:
         return info
-    first_user = ""
+    first_q = first_user = ""
     for line in lines:
         rec = _loads(line)
         if not rec:
@@ -270,18 +276,23 @@ def _head_info(path):
             info["cwd"] = rec["cwd"]
         if info["entry"] is None and isinstance(rec.get("entrypoint"), str):
             info["entry"] = rec["entrypoint"]
-        if not info["title"] and rec.get("type") == "queue-operation":
+        if not info["custom_title"] and rec.get("type") == "custom-title":
+            ct = rec.get("customTitle")
+            if isinstance(ct, str) and ct.strip():
+                info["custom_title"] = _clean_title(ct)
+        if not info["compacted"] and rec.get("compactMetadata"):
+            info["compacted"] = True
+        if not first_q and rec.get("type") == "queue-operation":
             c = rec.get("content")
             if isinstance(c, str) and c.strip():
-                info["title"] = _clean_title(c)
+                first_q = _clean_title(c)
         if not first_user and rec.get("type") == "user":
             t = _text_of((rec.get("message") or {}).get("content"))
             if t and not _is_meta_user(rec, t):
                 first_user = _clean_title(t)
-        if info["cwd"] and info["entry"] and (info["title"] or first_user):
+        if info["cwd"] and info["entry"] and info["custom_title"] and info["compacted"]:
             break
-    if not info["title"]:
-        info["title"] = first_user
+    info["title"] = info["custom_title"] or first_q or first_user
     return info
 
 
@@ -492,6 +503,8 @@ def _file_infos():
                         "project_name": (cwd.rstrip("\\/").split("\\")[-1] if cwd else proj.name),
                         "title": head["title"] or "（沒有標題）",
                         "entry": head["entry"] or "cli",
+                        "custom_title": head["custom_title"],
+                        "compacted": head["compacted"],
                         "preview": tail["preview"],
                         "ts": tail["ts"],
                         "last_epoch": _iso_epoch(tail["ts"]) or st.st_mtime,
@@ -620,6 +633,40 @@ def api_rooms():
     return rooms
 
 
+def _merge_compact_generations(infos):
+    """把同一場對話的多個 compact 世代併成一列。
+
+    每次 /compact（或自動壓縮）Claude Code 都會換一個新的 session id、
+    另開一個 jsonl，把壓縮後的完整歷史複製進去。不合併的話，一場聊了整天、
+    compact 過五次的對話會在列表上長成五間，而且每一間的標題都是使用者
+    當時講的第一句話 —— 看起來就像「每講一句話就開一間」。
+
+    合併鍵用 (custom-title, cwd)：custom-title 是桌面 app 顯示的名字，同一場
+    對話的所有世代都一樣。沒有 custom-title 的檔（早期版本、CLI 開的）維持獨立，
+    不靠猜的欄位去併，寧可少併也不要把兩場不同的對話併成一場。
+    """
+    groups = {}
+    out = []
+    for fi in infos:
+        ct = fi.get("custom_title")
+        if not ct:
+            out.append(fi)
+            continue
+        groups.setdefault((ct, _norm_cwd(fi.get("project"))), []).append(fi)
+
+    for gen_list in groups.values():
+        if len(gen_list) == 1:
+            out.append(gen_list[0])
+            continue
+        # 最新世代代表這場對話：點進去接續的必須是它，接到舊世代等於回到 compact 前
+        gen_list.sort(key=lambda x: x["last_epoch"], reverse=True)
+        newest = dict(gen_list[0])
+        newest["generations"] = len(gen_list)
+        newest["gen_sids"] = [g["sid"] for g in gen_list]
+        out.append(newest)
+    return out
+
+
 def scan_rooms(show_all=False):
     """檔案 × 桌面登錄 對齊：
     - 檔名直接命中登錄 id → 綁定
@@ -627,7 +674,7 @@ def scan_rooms(show_all=False):
     可見 = 桌面未封存 + 一般 CLI 對話 + 快照之後的新桌面對話；
     隱藏 = 已封存、排程機器人(sdk-cli)、舊桌面殘檔。
     """
-    infos = _file_infos()
+    infos = _merge_compact_generations(_file_infos())
     snap = load_snapshot()
     sessions = snap.get("sessions", {})
     gen_at = snap.get("generated_at", 0)
@@ -676,13 +723,16 @@ def scan_rooms(show_all=False):
     rooms = []
     for fi in infos:
         room = dict(fi)
-        rid = assigned.get(fi["sid"])
+        # 合併過的列要用整組世代來判斷，不能只看代表那一代的 sid
+        sids = fi.get("gen_sids") or [fi["sid"]]
+        rid = next((assigned[x] for x in sids if x in assigned), None)
         reg = sessions.get(rid) if rid else None
         archived = bool(reg and reg.get("archived"))
-        if reg and reg.get("title"):
+        if reg and reg.get("title") and not fi.get("custom_title"):
+            # custom-title 是桌面 app 當下顯示的名字，比快照裡的舊標題新
             room["title"] = reg["title"]
         # 來源規則（先不管封存）
-        if fi["sid"] in app_sids:
+        if any(x in app_sids for x in sids):
             # 這個 App 自己開的對話。它的 entrypoint 也是 sdk-cli，
             # 所以要排在那條過濾規則前面，否則使用者一開新對話就看不到了
             base = True
@@ -694,8 +744,8 @@ def scan_rooms(show_all=False):
             base = fi["last_epoch"] > gen_at - 3600
         else:
             base = True
-        # 網頁端封存標記覆蓋桌面快照
-        ov = overlay.get(fi["sid"])
+        # 網頁端封存標記覆蓋桌面快照（任一世代被標記就算數）
+        ov = next((overlay[x] for x in sids if x in overlay), None)
         if ov == "archived":
             archived = True
         elif ov == "active":
@@ -708,7 +758,7 @@ def scan_rooms(show_all=False):
         if not visible and not show_all:
             continue
         room["hidden"] = not visible
-        room["live"] = fi["sid"] in live
+        room["live"] = any(x in live for x in sids)
         room["engine"] = "claude"
         rooms.append(room)
 
