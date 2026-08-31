@@ -1,0 +1,7 @@
+{
+  "bind_tailscale": false,
+  "auth_token": "",
+  "default_mode": "plan",
+  "allow_home_reads": false,
+  "extra_file_roots": []
+}

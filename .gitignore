@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Runtime data the server creates/reads on its own machine — all of this is
+# local session history and must never be committed or shared.
+desktop-sessions.json
+web-archive.json
+uploads/
+trash/
+logs/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Fork/working notes — never publish (they contain the source machine details)
+FORK_REPORT.md
+*_REPORT.md
+
+# Local runtime config (may contain an auth token)
+config.json
+
+# API keys for the chat-only engines — never commit
+api-keys.json
+api-chats/
+
+# Lint/test caches
+.ruff_cache/
+.pytest_cache/
+
+# Sessions this app created (runtime state)
+app-sessions.json

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0e17">
+<title>Claude 聊天室</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<link rel="icon" type="image/png" href="/static/icon-192.png">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 聊天室清單 -->
+<div id="screen-list" class="screen">
+  <header class="bar">
+    <div class="bar-title">訊息</div>
+    <button id="btn-settings" class="icon-btn" title="設定">⚙︎</button>
+  </header>
+  <div class="search-wrap">
+    <input id="search" type="search" placeholder="搜尋聊天室…" autocomplete="off">
+  </div>
+  <div id="proj-chips" class="chips"></div>
+  <div id="room-list" class="room-list">
+    <div class="empty-hint">載入中…</div>
+  </div>
+  <button id="btn-new" class="fab" title="開新聊天室">＋</button>
+</div>
+
+<!-- 對話 -->
+<div id="screen-chat" class="screen chat hidden-right">
+  <header class="bar">
+    <button id="btn-back" class="icon-btn back">‹</button>
+    <div class="bar-mid">
+      <div id="chat-title" class="bar-title small">—</div>
+      <div id="chat-sub" class="bar-sub">—</div>
+    </div>
+    <button id="btn-room" class="model-btn">預設</button>
+  </header>
+  <div id="ctx-bar" class="ctx-bar hidden">
+    <div class="ctx-track"><i id="ctx-fill"></i></div>
+    <span id="ctx-label"></span>
+  </div>
+  <div id="messages" class="messages"></div>
+  <div id="jump-bottom" class="jump-bottom hidden">↓</div>
+  <div id="attach-strip" class="attach-strip hidden"></div>
+  <div class="composer">
+    <button id="btn-attach" class="attach-btn" title="傳圖片">＋</button>
+    <input id="file-input" type="file" accept="image/*" multiple class="hidden">
+    <button id="btn-mic" class="attach-btn mic" title="語音輸入">🎙</button>
+    <textarea id="input" rows="1" placeholder="輸入訊息…" enterkeyhint="send"></textarea>
+    <button id="btn-send" class="send-btn">↑</button>
+    <button id="btn-stop" class="send-btn stop hidden">■</button>
+  </div>
+</div>
+
+<!-- 新聊天室：先選 AI -->
+<div id="sheet-engine" class="sheet-mask hidden">
+  <div class="sheet">
+    <div class="sheet-title">要跟哪個 AI 聊？</div>
+    <div id="engine-list" class="project-list"></div>
+    <button class="sheet-cancel" data-close="sheet-engine">取消</button>
+  </div>
+</div>
+
+<!-- 新聊天室：選專案 -->
+<div id="sheet-new" class="sheet-mask hidden">
+  <div class="sheet">
+    <div class="sheet-title">在哪個專案開新聊天室？</div>
+    <div id="project-list" class="project-list"></div>
+    <button class="sheet-cancel" data-close="sheet-new">取消</button>
+  </div>
+</div>
+
+<!-- 長按聊天室的動作 -->
+<div id="sheet-actions" class="sheet-mask hidden">
+  <div class="sheet">
+    <div id="action-title" class="sheet-title">聊天室</div>
+    <div class="mode-opts">
+      <button id="btn-archive" class="action-btn">📥 封存</button>
+      <button id="btn-delete" class="action-btn danger">🗑 刪除（移到垃圾桶）</button>
+    </div>
+    <button class="sheet-cancel" data-close="sheet-actions">取消</button>
+  </div>
+</div>
+
+<!-- 這個聊天室的模型/力度 -->
+<div id="sheet-room" class="sheet-mask hidden">
+  <div class="sheet">
+    <div class="sheet-title">這個聊天室怎麼回</div>
+    <div class="setting-label">模型（只影響這個聊天室）</div>
+    <div class="seg" id="seg-room-model">
+      <button data-v="default">預設</button><button data-v="fable">Fable</button><button data-v="opus">Opus</button><button data-v="sonnet">Sonnet</button><button data-v="haiku">Haiku</button>
+    </div>
+    <div class="setting-label">思考力度</div>
+    <div class="seg" id="seg-room-effort">
+      <button data-v="default">預設</button><button data-v="max">最深</button><button data-v="high">多</button><button data-v="medium">中</button><button data-v="low">快</button>
+    </div>
+    <div class="setting-note">「預設」= 用設定頁裡的全域選擇。從下一句開始生效。</div>
+    <button class="sheet-cancel" data-close="sheet-room">關閉</button>
+  </div>
+</div>
+
+<!-- 設定 -->
+<div id="sheet-settings" class="sheet-mask hidden">
+  <div class="sheet">
+    <div class="sheet-title">設定</div>
+
+    <div class="setting-label">外觀</div>
+    <div class="seg" id="seg-theme">
+      <button data-v="auto">自動</button><button data-v="light">淺色</button><button data-v="dark">深色</button>
+    </div>
+
+    <div class="setting-label">其他 AI（貼上 API key 就能用）</div>
+    <button id="keys-toggle" class="collapse-head">Grok / Gemini / ChatGPT / DeepSeek… ▾</button>
+    <div id="keys-panel" class="hidden"></div>
+
+    <div class="setting-label">方案額度與用量</div>
+    <button id="usage-toggle" class="collapse-head">額度百分比＋token 統計 ▾</button>
+    <div id="usage-panel" class="hidden">
+      <div id="limits-box" class="usage-box">載入中…</div>
+      <div id="usage-box" class="usage-box" style="margin-top:8px">載入中…</div>
+    </div>
+
+    <div class="setting-label">用哪個模型回答（全域預設；聊天室右上角可個別調）</div>
+    <div class="mode-opts compact">
+      <label class="mode-opt"><input type="radio" name="model" value="default">
+        <div><b>預設</b><span>跟著電腦上目前的設定走，不特別指定。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="model" value="fable">
+        <div><b>Fable 5</b><span>最聰明也最貴，留給真的很難的任務。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="model" value="opus">
+        <div><b>Opus 5</b><span>聰明的主力，日常大部分工作用它。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="model" value="sonnet">
+        <div><b>Sonnet 5</b><span>速度快、夠聰明，一般問答和小修改。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="model" value="haiku">
+        <div><b>Haiku 4.5</b><span>最快最省，查小事、簡單問題用。</span></div></label>
+    </div>
+
+    <div class="setting-label">思考力度（effort）</div>
+    <div class="mode-opts compact">
+      <label class="mode-opt"><input type="radio" name="effort" value="default">
+        <div><b>預設</b><span>跟著電腦上目前的設定走。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="effort" value="max">
+        <div><b>想最深</b><span>花最多時間思考，答案最完整但最慢。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="effort" value="high">
+        <div><b>想得多</b><span>比預設再認真一點。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="effort" value="medium">
+        <div><b>普通</b><span>平衡的思考量。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="effort" value="low">
+        <div><b>快答</b><span>想得少、回得快，適合簡單問題。</span></div></label>
+    </div>
+
+    <div class="setting-label">Claude 的做事權限</div>
+    <div class="mode-opts">
+      <label class="mode-opt">
+        <input type="radio" name="mode" value="auto">
+        <div><b>全自動</b><span>Claude 可以直接查資料、改檔案、跑指令，不會一件一件問你。手機遙控用這個最順。</span></div>
+      </label>
+      <label class="mode-opt">
+        <input type="radio" name="mode" value="edits">
+        <div><b>只准改檔案</b><span>Claude 可以讀和改檔案，但跑指令之類的動作會被擋下來，它會告訴你它被擋了。</span></div>
+      </label>
+      <label class="mode-opt">
+        <input type="radio" name="mode" value="plan">
+        <div><b>只討論不動手</b><span>Claude 只能看和回答，不會改任何東西。適合純聊規劃。</span></div>
+      </label>
+    </div>
+
+    <div class="setting-label">聊天室清單</div>
+    <label class="mode-opt">
+      <input type="checkbox" id="chk-all">
+      <div><b>顯示全部（含封存與排程機器人）</b><span>平常只顯示跟桌面 app 一樣的清單＋手機上開的對話。打開這個會把已封存的舊對話和自動排程的機器人紀錄也列出來。</span></div>
+    </label>
+
+    <div id="health-line" class="setting-note"></div>
+    <button class="sheet-cancel" data-close="sheet-settings">關閉</button>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
