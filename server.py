@@ -33,6 +33,7 @@ STATIC = BASE / "static"
 LOG_FILE = BASE / "logs" / "server.log"
 PORT = 8899
 TAILSCALE_EXE = r"C:\Program Files\Tailscale\tailscale.exe"
+TAILSCALE_WAIT = 120   # 開機時最多等 Tailscale 幾秒
 
 
 log = logging.getLogger("claude-chat")
@@ -75,18 +76,24 @@ def bind_hosts():
     hosts = ["127.0.0.1"]
     if not CONFIG["bind_tailscale"]:
         return hosts
-    try:
-        out = subprocess.run([TAILSCALE_EXE, "ip", "-4"], capture_output=True,
-                             text=True, timeout=10,
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-        ip = out.stdout.strip().splitlines()[0].strip() if out.stdout.strip() else ""
-        if ip.startswith("100."):
-            hosts.append(ip)
-        else:
-            log.warning("bind_tailscale 開著但找不到 Tailscale IP，只綁 127.0.0.1")
-    except Exception as e:
-        log.warning("查 Tailscale IP 失敗，只綁 127.0.0.1：%s", e)
-    return hosts
+    # 登入時排程比 Tailscale 先起來，第一次查會查不到 → 最多等 2 分鐘再放棄
+    # （09-02 中招：18:40 重新登入後只綁了 127.0.0.1，手機整晚連不上）
+    deadline = time.time() + TAILSCALE_WAIT
+    while True:
+        try:
+            out = subprocess.run([TAILSCALE_EXE, "ip", "-4"], capture_output=True,
+                                 text=True, timeout=10,
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+            ip = out.stdout.strip().splitlines()[0].strip() if out.stdout.strip() else ""
+            if ip.startswith("100."):
+                hosts.append(ip)
+                return hosts
+        except Exception as e:
+            log.warning("查 Tailscale IP 失敗：%s", e)
+        if time.time() >= deadline:
+            log.warning("等了 %d 秒還是找不到 Tailscale IP，只綁 127.0.0.1", TAILSCALE_WAIT)
+            return hosts
+        time.sleep(3)
 MAX_ROOMS = 250
 MAX_CONCURRENT_RUNS = 4
 HEAD_BYTES = 128 * 1024
