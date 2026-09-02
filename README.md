@@ -22,7 +22,7 @@ Everything below is about what happens when you loosen those.
 
 1. **Private network only, never the public internet.** Setting `bind_tailscale` puts the server on your tailnet. That is fine for a VPN only you are on. Do not port-forward it, do not give it a public IP, do not run it on a cloud box with an open port, and do not put it behind Tailscale **Funnel** (Funnel publishes to the whole internet; plain `tailscale serve` stays inside your tailnet). Treat "someone can reach this port" as equivalent to "someone is sitting at your keyboard."
 2. **Authentication is opt-in, and you should turn it on the moment you leave loopback.** Set `auth_token` in `config.json` (or the `CLAUDE_CHAT_TOKEN` environment variable). Requests from `127.0.0.1` skip the check; everything else must send the token as an `X-Auth-Token` header or a `?token=` query parameter. With no token set and `bind_tailscale` on, anyone who can reach the port has full access — they can read your history, send messages as you, and get the agent to run commands. Also note: behind a reverse proxy every request looks like it came from `127.0.0.1`, so the loopback exemption would let everyone through. Don't put this behind one.
-3. **`auto` mode lets the agent act without asking.** In that mode Claude Code runs with `--dangerously-skip-permissions` and Codex with `--dangerously-bypass-approvals-and-sandbox`, so the agent reads files, writes files, and executes shell commands with no prompt. That is what makes "control your computer from your phone" actually work, and it is also how a malicious or careless message does real damage. The alternatives, selectable per room in the in-app Settings sheet: **`edits`** maps to Claude Code's `acceptEdits`, which auto-approves file edits and — per Anthropic's documentation — some filesystem commands too, so it is *not* a guarantee that nothing executes; **`plan`** is genuinely read-only, and is the default. Unknown mode values are rejected outright rather than falling back to something permissive.
+3. **`auto` mode lets the agent act without asking.** In that mode Claude Code runs with `--dangerously-skip-permissions` and Codex with `--dangerously-bypass-approvals-and-sandbox`, so the agent reads files, writes files, and executes shell commands with no prompt. That is what makes "control your computer from your phone" actually work, and it is also how a malicious or careless message does real damage. The alternatives, selectable per room in the in-app Settings sheet: **`edits`** maps to Claude Code's `acceptEdits`, which auto-approves file edits and — per Anthropic's documentation — some filesystem commands too, so it is *not* a guarantee that nothing executes; **`ask`** shows every command / edit / fetch on the phone as an allow-or-deny card before it runs (see "Permission cards"); **`plan`** is genuinely read-only, and is the default. Unknown mode values are rejected outright rather than falling back to something permissive.
 4. **`/api/file` and `/api/upload` are only as safe as the folders you expose.** By default `/api/file` serves nothing but this app's own `uploads/` folder. Turning on `allow_home_reads` exposes your **entire home directory** to anyone who can reach the server — including `~/.claude/.credentials.json`, SSH keys, and every private document under it. That is a convenience trade-off, not a safe default; enable it only on a network where you are the only participant. HTML, SVG, XML and JavaScript are always sent as downloads rather than rendered, so a file the agent generated cannot execute as a page inside this app's origin.
 
 If any of this is unacceptable for your situation, don't run this tool — it was built for a single trusted user on a single trusted private network.
@@ -98,9 +98,14 @@ This is served by `GET /api/file?path=...`, which only reads from an allow-list:
 - To allow more folders, add absolute paths to `extra_file_roots` in `config.json`.
 - Setting `allow_home_reads: true` adds your entire home directory. That is convenient — the agent can show you anything it produced anywhere — but it also exposes `~/.claude/.credentials.json`, SSH keys, and every private document under your home folder to whoever can reach the server. Only do this on a network where you are the only participant.
 
-**Sending images to Claude:**
+**Sending images and documents to Claude:**
 
-Tap "+" next to the composer to attach a photo (camera or library, multiple at once). It uploads to a local `uploads\` folder (created automatically) and the message text gets a `[phone photo, please use Read to view: <path>]` note appended so Claude knows to look at it. Accepts png/jpg/gif/webp, 25 MB max per file.
+Tap "+" next to the composer to attach a photo (camera or library) or a document, multiple at once. It uploads to a local `uploads\` folder (created automatically) and the message text gets a `[phone photo, please use Read to view: <path>]` (or `[phone file, please use Read to read: <path>]`) note appended so Claude knows to look at it. Accepts png/jpg/gif/webp and pdf/txt/md/csv/json (magic bytes are checked), 25 MB max per file.
+
+**Rename & full-text search:**
+
+- Long-press a room → **Rename**. Stored in `web-titles.json` (gitignored); clear the name to fall back to the original title.
+- Type two or more characters in the search box and, besides matching titles, the server searches the *content* of every visible conversation (`GET /api/search?q=`, last 1.5 MB of each transcript). Matching rooms show the hit as their preview line, prefixed with 🔎.
 
 **Appearance & per-room settings:**
 
@@ -117,9 +122,20 @@ Tap "+" next to the composer to attach a photo (camera or library, multiple at o
 - One room can only run one message at a time; the whole server allows at most 4 concurrent runs (`MAX_CONCURRENT_RUNS` in `server.py`).
 - For an `https://` URL instead of `http://`, enable Tailscale **Serve** on your tailnet and run `tailscale serve --bg 8899` — optional, and it does not change who can reach the server (Serve stays inside your tailnet). Do not use Tailscale **Funnel**, which would publish it to the open internet.
 
-### Optional: aligning with another session list
+### Two-way sync with the Claude Code desktop app
 
-If a `desktop-sessions.json` file exists next to `server.py`, the server will use it to override room titles and archive-state, and to fold in rooms it wouldn't otherwise recognize. This is entirely optional — the app works fully from the raw `.jsonl` files alone. The expected shape, if you want to populate it yourself:
+If the Claude desktop app is installed on the server machine, the room list lines up with it in both directions. None of this is documented by Anthropic — it was worked out from the app bundle (version 1.40609.1) and verified by hand, so a future desktop release may break it; everything degrades to "no desktop app" behaviour when it does.
+
+**Desktop → phone (automatic, live).** The desktop app keeps one JSON file per session under `%APPDATA%\Claude\claude-code-sessions\<account>\<org>\local_<id>.json`; its `cliSessionId` is the `.jsonl` file name in `~/.claude/projects`. The server reads those files (5-second cache) for titles, archive state and project paths, so archiving or renaming a session on the desktop shows up on the phone a few seconds later. The IndexedDB copy is never touched.
+
+**Phone → desktop (`claude://` deep link).** Sessions started from the phone don't exist in the desktop app's list. The desktop app registers the `claude://` URL scheme, and `claude://resume?session=<cli-session-id>` imports an on-disk transcript into its list — same file, nothing copied, and both sides keep appending to it afterwards. (This is what the CLI's `/desktop` command uses too.)
+
+- Settings → **Sync to desktop app**: `auto` (a new phone-started room is imported as soon as its first turn finishes; the desktop app switches to that session once), `manual`, or `off`. Stored as `desktop_sync` in `config.json`.
+- Long-press a room → **Open in desktop app**: imports it if needed, otherwise just switches the desktop app to it via `claude://code/continue?session=local_<id>`. Re-importing the same session does not create a duplicate.
+- Rooms started from the phone that the desktop hasn't registered yet carry a "phone only" tag.
+- Caveats seen in practice: the imported session has no title on the desktop side until you name it there; opening it on the desktop spawns a CLI process, so the phone shows the "desktop open" tag; writing the registry JSON directly is *not* picked up by a running desktop app, only the deep link works.
+
+**Fallback: a static snapshot.** On machines without the desktop app, a `desktop-sessions.json` file next to `server.py` (optional, gitignored, never generated by this repo) is used the same way. The expected shape, if you want to populate it yourself:
 
 ```json
 {
@@ -130,8 +146,6 @@ If a `desktop-sessions.json` file exists next to `server.py`, the server will us
 }
 ```
 
-This file is git-ignored and never generated automatically by this repo.
-
 ## Configuration
 
 Copy `config.example.json` to `config.json` (gitignored) and set what you need. Every key is optional; anything you leave out keeps the safe default.
@@ -140,9 +154,10 @@ Copy `config.example.json` to `config.json` (gitignored) and set what you need. 
 |---|---|---|
 | `bind_tailscale` | `false` | `true` also binds your Tailscale IP so your phone can reach it. Leave it off and only this machine can connect. |
 | `auth_token` | `""` (off) | Require this token on every non-loopback request (`X-Auth-Token` header or `?token=`). **Set this whenever `bind_tailscale` is on.** The `CLAUDE_CHAT_TOKEN` environment variable overrides it. |
-| `default_mode` | `"plan"` | Permission mode used when the client doesn't specify one: `plan` (read-only), `edits`, or `auto` (no prompts — see security warning 3). |
+| `default_mode` | `"plan"` | Permission mode used when the client doesn't specify one: `plan` (read-only), `ask` (every Bash/Edit/Write/WebFetch/MCP call is approved or denied from the phone — see "Permission cards" below), `edits`, or `auto` (no prompts — see security warning 3). |
 | `allow_home_reads` | `false` | `true` lets `GET /api/file` read anything under your home directory, credentials included. See security warning 4. |
 | `extra_file_roots` | `[]` | Additional folders `GET /api/file` may read from. |
+| `desktop_sync` | `"manual"` | How phone-started sessions get into the Claude desktop app: `auto`, `manual` (only via the long-press action), or `off`. Changeable from the in-app Settings sheet. |
 
 A few constants near the top of `server.py` are also worth knowing: `PORT` (8899), `MAX_CONCURRENT_RUNS` (4 simultaneous agent runs server-wide), `MAX_ROOMS` (250 rooms in the normal list view), and `TAILSCALE_EXE` (where to look for Tailscale when auto-detecting its IP).
 
@@ -190,6 +205,14 @@ globally is safe. To register, add to `hooks.PreToolUse` in `~/.claude/settings.
 }
 ```
 
+### Permission cards (the `ask` mode)
+
+Claude Code's default permission mode has no UI under `-p`, so every tool that needs approval is silently denied. The `ask` mode gives you the desktop app's "manual" experience on the phone instead:
+
+1. In `ask` mode the run is spawned with the default permission mode plus `--settings perm-settings.json`, a file the server regenerates on start. It registers `perm-bridge.js` as a `PreToolUse` hook for `Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|mcp__.*` — only for runs this server starts (the hook exits immediately without `CLAUDE_CHAT_RUN_ID`), so your global `~/.claude/settings.json`, the desktop app and the plain CLI are untouched.
+2. Before Claude runs one of those tools, the hook POSTs it to `/api/perm` and the phone shows a card with the command / file / URL and three buttons: **Allow**, **Deny**, and **Allow everything for the rest of this run**.
+3. Your tap is returned as the hook's `permissionDecision`. No answer within ~9.5 minutes counts as a deny, and Claude is told to explain where it stopped rather than retry. Read-only tools (Read, Grep, Glob…) never ask.
+
 ### Troubleshooting
 
 - **"claude" can't be found / server won't start a run:** the executable lookup logic lives in `resolve_claude_cmd()` near the top of `server.py`. It tries, in order: the Claude Code CLI's own `claude.exe`, then `node` + `cli.js` directly, then falls back to `claude.cmd` via `cmd.exe`. If a Claude Code / npm update moves things, start here.
@@ -201,6 +224,7 @@ globally is safe. To register, add to `hooks.PreToolUse` in `~/.claude/settings.
 - **Windows only, as written.** Porting to macOS/Linux means replacing the `ctypes.windll`-based process-liveness check, the `taskkill` call used to stop a run, `CREATE_NO_WINDOW`, and the Tailscale executable auto-detection (or dropping/reimplementing that last one for the target platform).
 - **Authentication is a single shared token, and it is off by default.** There are no accounts, no roles, and no per-user anything: either you know the token or you don't (and requests from `127.0.0.1` skip the check entirely). That is enough for one person on a private network and nowhere near enough for multi-user or internet-facing use.
 - **No built-in HTTPS.** Use `tailscale serve` if you want a TLS-terminated URL.
+- **Desktop-app sync relies on undocumented behaviour** (the per-session registry files and the `claude://resume` deep link). It works on desktop app 1.40609.1; if a newer release changes either, the room list falls back to transcripts-only and the sync buttons stop doing anything useful.
 - **Single machine, single user.** There's no concept of accounts; concurrency is capped globally (`MAX_CONCURRENT_RUNS`), not per-user.
 - **Reads transcripts from disk on every poll.** Cached by file size/mtime, so it stays cheap up to a few hundred sessions, but it wasn't built to scale past that.
 

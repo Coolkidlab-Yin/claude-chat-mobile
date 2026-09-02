@@ -47,6 +47,7 @@ CONFIG_DEFAULTS = {
     "default_mode": "plan",    # plan / edits / auto，auto 等於讓 AI 免詢問執行指令
     "extra_file_roots": [],    # /api/file 額外開放的資料夾，預設只開上傳目錄
     "allow_home_reads": False, # True = /api/file 可讀整個家目錄（含憑證，危險）
+    "desktop_sync": "manual",  # auto = 手機開的新對話做完第一輪就自動登錄進桌面 app；manual = 只在按鈕按下時；off = 不用
 }
 
 
@@ -144,6 +145,113 @@ def _write_ask_mcp_config():
 
 
 ASK_MCP_READY = _write_ask_mcp_config()
+
+# ---------- 逐項授權（「先問我」模式）手機橋接 ----------
+# -p 在 default 權限模式下，沒被允許的工具會直接被拒。掛一個 PreToolUse hook：
+# 要動手（Bash/Edit/Write…）前先 POST /api/perm → 手機跳「允許／拒絕」卡 → 決定當 hook 結果。
+# 這份 settings 只在 ask 模式用 --settings 帶進去，桌面 app 與一般 CLI 完全不受影響。
+PERM_BRIDGE_JS = BASE / "perm-bridge.js"
+PERM_SETTINGS = BASE / "perm-settings.json"
+PERM_MATCHER = "Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|mcp__.*"
+
+
+def _write_perm_settings():
+    if not PERM_BRIDGE_JS.exists():
+        return False
+    node = shutil.which("node")
+    if not node:
+        pf = Path(r"C:\Program Files\nodejs\node.exe")
+        node = str(pf) if pf.exists() else "node"
+    cfg = {"hooks": {"PreToolUse": [{
+        "matcher": PERM_MATCHER,
+        "hooks": [{"type": "command", "command": f'"{node}" "{PERM_BRIDGE_JS}"', "timeout": 600}],
+    }]}}
+    PERM_SETTINGS.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
+
+
+PERM_READY = _write_perm_settings()
+
+# ---------- 桌面 app 的 session 登錄 ----------
+# 桌面 app 把每個 session 存成一個 json（Windows 在 %APPDATA%\Claude\claude-code-sessions\<帳號>\<組織>\local_<id>.json），
+# 裡面的 cliSessionId 就是 ~/.claude/projects 那個 jsonl 的檔名 —— 兩邊靠這個對齊，不用再猜時間。
+# 手機開的對話要進桌面 app：桌面 app 有註冊 claude:// 協定，claude://resume?session=<cli sid> 會把
+# 磁碟上的 jsonl 匯進登錄（同一份紀錄，不複製），之後兩邊都寫同一個檔。直接寫登錄 json 桌面 app 不會即時吃到，實測過。
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_desktop_reg_cache = {"at": 0.0, "data": {}}
+DESKTOP_REG_TTL = 5.0
+
+
+def _desktop_reg_dirs():
+    cands = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        cands.append(Path(appdata) / "Claude" / "claude-code-sessions")
+    cands.append(HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions")
+    return [p for p in cands if p.is_dir()]
+
+
+def desktop_registry():
+    """cli session id -> {local_id, title, archived, cwd, last(epoch 秒)}；沒有桌面 app 就是空 dict。"""
+    now = time.time()
+    if now - _desktop_reg_cache["at"] < DESKTOP_REG_TTL:
+        return _desktop_reg_cache["data"]
+    out = {}
+    for root in _desktop_reg_dirs():
+        for f in root.glob("*/*/local_*.json"):
+            try:
+                d = json.loads(f.read_text("utf-8"))
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            local_id = d.get("sessionId") or f.stem
+            cli = d.get("cliSessionId") or local_id.replace("local_", "", 1)
+            last = d.get("lastActivityAt") or d.get("createdAt") or 0
+            out[cli] = {
+                "local_id": local_id,
+                "title": _clean_title(d.get("title") or ""),
+                "archived": bool(d.get("isArchived")),
+                "cwd": d.get("cwd") or "",
+                "last": (last / 1000.0) if isinstance(last, (int, float)) else 0,
+            }
+    _desktop_reg_cache.update(at=now, data=out)
+    return out
+
+
+def desktop_app_available():
+    """桌面 app 有沒有裝（看 claude:// 協定有沒有註冊）。"""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\claude\shell\open\command"):
+                return True
+        except OSError:
+            return False
+    if sys.platform == "darwin":
+        return (Path("/Applications/Claude.app").exists()
+                or (HOME / "Applications" / "Claude.app").exists())
+    return False
+
+
+def desktop_open(sid):
+    """把一個 CLI session 匯進桌面 app 並切過去；已經在登錄裡的就只是切過去。
+    回 'imported' / 'opened' / 'unavailable'。"""
+    if not sid or not _UUID_RE.match(sid):
+        raise ValueError("session id 格式不對")
+    if not desktop_app_available():
+        return "unavailable"
+    reg = desktop_registry().get(sid)
+    if reg:
+        url = f"claude://code/continue?session={reg['local_id']}"
+    else:
+        url = f"claude://resume?session={sid}"
+    if sys.platform == "win32":
+        os.startfile(url)  # noqa: S606 - 交給系統的協定處理器（桌面 app）
+    else:
+        subprocess.Popen(["open", url])
+    _desktop_reg_cache["at"] = 0.0
+    return "opened" if reg else "imported"
 
 CODEX_EXE = shutil.which("codex.cmd") or str(HOME / "AppData" / "Roaming" / "npm" / "codex.cmd")
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
@@ -463,6 +571,37 @@ def remember_app_sid(sid):
     _app_sids_cache["mtime"] = None
 
 
+TITLES_FILE = BASE / "web-titles.json"   # 手機上改的聊天室名字 {sid: title}
+_titles_cache = {"mtime": None, "data": {}}
+
+
+def load_titles():
+    try:
+        m = TITLES_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if _titles_cache["mtime"] != m:
+        try:
+            d = json.loads(TITLES_FILE.read_text("utf-8"))
+            _titles_cache["data"] = d if isinstance(d, dict) else {}
+            _titles_cache["mtime"] = m
+        except Exception:
+            return {}
+    return _titles_cache["data"]
+
+
+def save_title(sid, title):
+    d = dict(load_titles())
+    if title:
+        d[sid] = title
+    else:
+        d.pop(sid, None)
+    tmp = TITLES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
+    os.replace(tmp, TITLES_FILE)
+    _titles_cache["mtime"] = None
+
+
 def load_overlay():
     """網頁端的封存標記：{sid: "archived"|"active"}，疊在桌面快照之上。"""
     try:
@@ -487,7 +626,17 @@ def save_overlay(d):
 
 
 def load_snapshot():
-    """桌面 app session 登錄的快照（標題 + 封存狀態）。"""
+    """桌面 app 的 session 登錄（標題 + 封存狀態）。
+
+    有桌面 app 的機器直接讀它的登錄 json（即時、用 cliSessionId 精準對齊）；
+    沒有才退回手動匯出的 desktop-sessions.json 快照。
+    """
+    reg = desktop_registry()
+    if reg:
+        return {"generated_at": time.time(), "live": True,
+                "sessions": {sid: {"title": r["title"], "archived": r["archived"],
+                                   "cwd": r["cwd"], "last": r["last"]}
+                             for sid, r in reg.items()}}
     empty = {"generated_at": 0, "sessions": {}}
     try:
         m = SNAP_FILE.stat().st_mtime
@@ -790,6 +939,8 @@ def scan_rooms(show_all=False):
         room["hidden"] = not visible
         room["live"] = any(x in live for x in sids)
         room["engine"] = "claude"
+        room["desktop"] = bool(reg)                      # 桌面 app 登錄裡有它
+        room["app"] = any(x in app_sids for x in sids)   # 是從手機開的
         rooms.append(room)
 
     for extra in codex_rooms() + api_rooms():
@@ -799,8 +950,12 @@ def scan_rooms(show_all=False):
             continue
         rooms.append(extra)
 
+    titles = load_titles()
     for room in rooms:
         room["running"] = room["sid"] in BY_SESSION
+        t = titles.get(room["sid"])
+        if t:
+            room["title"] = t
     rooms.sort(key=lambda r: r["last_epoch"], reverse=True)
     return rooms[: (900 if show_all else MAX_ROOMS + 120)]
 
@@ -1129,6 +1284,8 @@ class Run:
         self.done = False
         self.proc = None
         self.started = time.time()
+        self.is_new = sid is None     # 這一輪是不是從手機開的新對話（做完要不要登錄進桌面 app）
+        self.allow_all = False        # 「先問我」模式下使用者按了「這次工作全部允許」
 
 
 RUNS = {}          # run_id -> Run
@@ -1159,6 +1316,9 @@ async def run_claude(run, text, mode, extra_args=()):
             "--allowedTools", "mcp__chat__ask_user",
             "--append-system-prompt", ASK_SYSTEM_PROMPT,
         ]
+    if mode == "ask" and PERM_READY:
+        # 逐項授權：default 權限模式 + 手機橋接 hook（沒有 hook 的話 -p 會把每個工具直接拒掉）
+        argv += ["--settings", str(PERM_SETTINGS)]
     argv += list(extra_args)
     if run.sid:
         argv += ["--resume", run.sid]
@@ -1246,6 +1406,13 @@ async def run_claude(run, text, mode, extra_args=()):
         if not got_done:
             msg = stderr_tail.strip() or f"claude 結束了但沒有回傳結果（exit {proc.returncode}）"
             await _emit(run, {"kind": "done", "ok": False, "sid": run.sid, "error": msg[-500:]})
+        elif run.is_new and run.sid and CONFIG["desktop_sync"] == "auto":
+            # 手機開的新對話做完第一輪就登錄進桌面 app（桌面 app 會切到這個 session，一次而已）
+            try:
+                res = await asyncio.to_thread(desktop_open, run.sid)
+                log.info("desktop sync %s -> %s", run.sid, res)
+            except Exception as e:
+                log.warning("desktop sync failed for %s: %s", run.sid, e)
     except Exception as e:
         log.exception("run_claude failed")
         await _emit(run, {"kind": "done", "ok": False, "sid": run.sid,
@@ -1297,11 +1464,42 @@ class SendBody(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "claude": CLAUDE_ARGV[0], "projects": PROJECTS_DIR.exists()}
+    return {"ok": True, "claude": CLAUDE_ARGV[0], "projects": PROJECTS_DIR.exists(),
+            "desktop_app": desktop_app_available(),
+            "desktop_registry": bool(desktop_registry()),
+            "desktop_sync": CONFIG["desktop_sync"],
+            "perm_ready": PERM_READY}
+
+
+class SettingsBody(BaseModel):
+    desktop_sync: str | None = None
+
+
+@app.post("/api/settings")
+def set_settings(body: SettingsBody):
+    """手機上能改的伺服器設定（目前只有桌面同步方式），寫回 config.json。"""
+    if body.desktop_sync is not None:
+        if body.desktop_sync not in ("auto", "manual", "off"):
+            raise HTTPException(400, "desktop_sync 只能是 auto / manual / off")
+        CONFIG["desktop_sync"] = body.desktop_sync
+        try:
+            user = json.loads(CONFIG_FILE.read_text("utf-8"))
+            if not isinstance(user, dict):
+                user = {}
+        except Exception:
+            user = {}
+        user["desktop_sync"] = body.desktop_sync
+        tmp = CONFIG_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(user, ensure_ascii=False, indent=2), "utf-8")
+        os.replace(tmp, CONFIG_FILE)
+    return {"ok": True, "desktop_sync": CONFIG["desktop_sync"]}
 
 
 UPLOAD_DIR = BASE / "uploads"
-UPLOAD_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+UPLOAD_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp",
+               # 桌面 app 能附 PDF/文件，手機也開放這幾種（AI 用 Read 工具讀）
+               ".pdf", ".txt", ".md", ".csv", ".json"}
+DOC_EXTS = {".pdf", ".txt", ".md", ".csv", ".json"}
 UPLOAD_MAX = 25 * 1024 * 1024
 UPLOAD_QUOTA = 2 * 1024 * 1024 * 1024   # 上傳資料夾總量上限
 UPLOAD_CHUNK = 256 * 1024
@@ -1343,7 +1541,7 @@ async def upload(file: UploadFile = File(...)):
     """手機上傳截圖/照片，回傳本機路徑（訊息裡引用，AI 用 Read 看圖）。"""
     ext = Path(file.filename or "").suffix.lower()
     if ext not in UPLOAD_EXTS:
-        raise HTTPException(400, "只收圖片（png/jpg/gif/webp）")
+        raise HTTPException(400, "只收圖片（png/jpg/gif/webp）或文件（pdf/txt/md/csv/json）")
     UPLOAD_DIR.mkdir(exist_ok=True)
     if _upload_dir_size() >= UPLOAD_QUOTA:
         raise HTTPException(507, "上傳資料夾已滿，先清一下 uploads/")
@@ -1367,7 +1565,13 @@ async def upload(file: UploadFile = File(...)):
                 out.write(chunk)
         if total == 0:
             raise HTTPException(400, "空檔案")
-        if not head.startswith(IMAGE_MAGIC):
+        if ext == ".pdf":
+            if not head.startswith(b"%PDF"):
+                raise HTTPException(400, "這個檔案的內容不是 PDF")
+        elif ext in DOC_EXTS:
+            if b"\x00" in head:
+                raise HTTPException(400, "這個檔案不是純文字")
+        elif not head.startswith(IMAGE_MAGIC):
             raise HTTPException(400, "這個檔案的內容不是圖片")
     except HTTPException:
         dest.unlink(missing_ok=True)
@@ -1734,6 +1938,185 @@ def room_delete(slug: str, sid: str):
     d.pop(sid, None)
     save_overlay(d)
     return {"ok": True, "trash": str(dest)}
+
+
+@app.post("/api/room/{slug}/{sid}/desktop")
+def room_desktop(slug: str, sid: str):
+    """把這個聊天室登錄進桌面 app 並切過去（只有 Claude 對話才有 jsonl 可以匯）。"""
+    if SLUG_ENGINE.get(slug):
+        raise HTTPException(400, "只有 Claude Code 的對話能同步到桌面 app")
+    find_room_file(slug, sid)
+    try:
+        res = desktop_open(sid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("desktop_open failed")
+        raise HTTPException(500, f"開不起來：{e}")
+    if res == "unavailable":
+        raise HTTPException(400, "這台電腦沒有裝 Claude 桌面 app")
+    return {"ok": True, "result": res}
+
+
+class TitleBody(BaseModel):
+    title: str = ""
+
+
+@app.post("/api/room/{slug}/{sid}/title")
+def room_title(slug: str, sid: str, body: TitleBody):
+    """改聊天室名字（存在 web-titles.json，空字串 = 還原）。"""
+    find_room_file(slug, sid)
+    t = _clean_title(body.title)
+    save_title(sid, t)
+    return {"ok": True, "title": t}
+
+
+SEARCH_TAIL = 1_500_000   # 每個對話只翻最後 1.5MB
+SEARCH_MAX_ROOMS = 40
+
+
+def _search_file(path, q, engine):
+    """在一個對話檔裡找 q（不分大小寫），回最多 3 段摘錄。"""
+    hits = []
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > SEARCH_TAIL:
+                f.seek(size - SEARCH_TAIL)
+                f.readline()   # 丟掉切半的那行
+            data = f.read()
+    except OSError:
+        return hits
+    ql = q.lower()
+    for line in data.decode("utf-8", "replace").splitlines():
+        if ql not in line.lower():
+            continue
+        rec = _loads(line)
+        if not rec:
+            continue
+        if engine == "codex":
+            if rec.get("type") != "event_msg":
+                continue
+            p = rec.get("payload") or {}
+            if p.get("type") not in ("user_message", "agent_message"):
+                continue
+            text = p.get("message") or ""
+            role = "user" if p["type"] == "user_message" else "assistant"
+        else:
+            role = rec.get("type") if rec.get("type") in ("user", "assistant") else rec.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            msg = rec.get("message") or rec
+            text = _text_of(msg.get("content"))
+            if role == "user" and _is_meta_user(rec, text):
+                continue
+        i = text.lower().find(ql)
+        if i < 0:
+            continue
+        start = max(0, i - 40)
+        snippet = text[start:start + 120].replace("\n", " ")
+        hits.append({"role": role, "snippet": ("…" if start else "") + snippet,
+                     "ts": rec.get("timestamp")})
+        if len(hits) >= 3:
+            break
+    return hits
+
+
+@app.get("/api/search")
+def search(q: str = "", all: int = 0):
+    """全文搜尋聊天內容（桌面 app 的「搜尋 session 內容」）。"""
+    q = (q or "").strip()
+    if len(q) < 2:
+        raise HTTPException(400, "至少兩個字")
+    out = []
+    for room in scan_rooms(show_all=bool(all)):
+        eng = room.get("engine", "claude")
+        if eng == "codex":
+            path = Path(room["path"])
+        elif eng != "claude":
+            path = API_CHATS / eng / (room["sid"] + ".jsonl")
+        else:
+            path = PROJECTS_DIR / room["slug"] / (room["sid"] + ".jsonl")
+        hits = _search_file(path, q, eng)
+        if hits:
+            out.append({"slug": room["slug"], "sid": room["sid"], "title": room["title"],
+                        "project_name": room["project_name"], "engine": eng,
+                        "ts": room["ts"], "hits": hits})
+        if len(out) >= SEARCH_MAX_ROOMS:
+            break
+    return {"q": q, "rooms": out}
+
+
+# ---------- 逐項授權（先問我模式） ----------
+PERMS = {}  # perm_id -> {"run_id", "tool", "input", "answer", "created"}
+
+
+class PermBody(BaseModel):
+    run_id: str
+    tool_name: str = ""
+    tool_input: dict = {}
+
+
+class PermAnswerBody(BaseModel):
+    decision: str = "deny"   # allow / deny / allow_all
+
+
+@app.post("/api/perm")
+async def perm_open(body: PermBody):
+    run = RUNS.get(body.run_id)
+    if not run or run.done:
+        raise HTTPException(404, "這個工作已經結束")
+    if run.allow_all:
+        return {"perm_id": None, "decision": "allow"}
+    perm_id = uuid.uuid4().hex[:12]
+    detail = _tool_detail(body.tool_name, body.tool_input)
+    PERMS[perm_id] = {"run_id": body.run_id, "tool": body.tool_name, "answer": None,
+                      "created": time.time()}
+    preview = ""
+    if isinstance(body.tool_input, dict):
+        for k in ("command", "content", "new_string", "url"):
+            v = body.tool_input.get(k)
+            if isinstance(v, str) and v.strip():
+                preview = v[:600]
+                break
+    await _emit(run, {"kind": "perm", "perm_id": perm_id, "tool": body.tool_name,
+                      "detail": detail, "preview": preview})
+    return {"perm_id": perm_id}
+
+
+@app.get("/api/perm/{perm_id}")
+async def perm_poll(perm_id: str):
+    p = PERMS.get(perm_id)
+    if not p:
+        raise HTTPException(404, "沒有這筆授權")
+    for _ in range(40):
+        if p["answer"] is not None:
+            return {"decision": p["answer"]}
+        run = RUNS.get(p["run_id"])
+        if not run or run.done:
+            return {"decision": "deny", "reason": "run_ended"}
+        if run.allow_all:
+            return {"decision": "allow"}
+        await asyncio.sleep(0.5)
+    return {"pending": True}
+
+
+@app.post("/api/perm/{perm_id}/answer")
+async def perm_answer(perm_id: str, body: PermAnswerBody):
+    p = PERMS.get(perm_id)
+    if not p:
+        raise HTTPException(404, "沒有這筆授權")
+    if body.decision not in ("allow", "deny", "allow_all"):
+        raise HTTPException(400, "decision 只能是 allow / deny / allow_all")
+    if p["answer"] is not None:
+        return {"ok": True, "already": True}
+    run = RUNS.get(p["run_id"])
+    if body.decision == "allow_all" and run:
+        run.allow_all = True
+    p["answer"] = "allow" if body.decision == "allow_all" else body.decision
+    if run:
+        await _emit(run, {"kind": "perm_done", "perm_id": perm_id, "decision": p["answer"]})
+    return {"ok": True}
 
 
 @app.get("/api/status")

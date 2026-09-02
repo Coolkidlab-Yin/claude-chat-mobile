@@ -44,3 +44,7 @@ api-chats/
 # Sessions this app created (runtime state)
 app-sessions.json
 ask-mcp-config.json
+perm-settings.json
+
+# Room titles renamed from the phone (runtime state)
+web-titles.json

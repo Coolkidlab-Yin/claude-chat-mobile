@@ -14,6 +14,8 @@ let stickBottom = true;
 let toolChips = {};          // tool_use_id -> chip element
 let typingEl = null;
 let roomsTimer = null;
+let serverInfo = {};         // /api/health 的結果（桌面 app 有沒有裝、同步方式）
+api("/api/health").then((h) => { serverInfo = h; }).catch(() => {});
 
 const mode = () => localStorage.getItem("cc-mode") || "auto";
 const modelPick = () => localStorage.getItem("cc-model") || "default";
@@ -238,12 +240,39 @@ function renderChips() {
   }
 }
 
+/* 全文搜尋（對話內容命中）：輸入 ≥2 字後 400ms 問一次伺服器 */
+let searchHits = { q: "", map: {} };
+let searchTimer = null;
+function scheduleSearch(q) {
+  clearTimeout(searchTimer);
+  if (q.length < 2) { searchHits = { q: "", map: {} }; return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      const r = await api("/api/search?q=" + encodeURIComponent(q) + (showAll() ? "&all=1" : ""));
+      const map = {};
+      for (const room of r.rooms) map[room.sid] = room;
+      searchHits = { q, map };
+      if ($("#search").value.trim().toLowerCase() === q) renderRooms();
+    } catch (e) { /* 搜不到就只留標題過濾 */ }
+  }, 400);
+}
+
 function renderRooms() {
   const q = $("#search").value.trim().toLowerCase();
   let shown = projFilter === "全部" ? rooms : rooms.filter((r) => r.project_name === projFilter);
-  if (q) shown = shown.filter((r) => (r.title + r.preview + r.project_name).toLowerCase().includes(q));
+  if (q) {
+    if (searchHits.q !== q) scheduleSearch(q);
+    const hits = searchHits.q === q ? searchHits.map : {};
+    shown = shown.filter((r) => hits[r.sid] || (r.title + r.preview + r.project_name).toLowerCase().includes(q));
+    shown = shown.map((r) => {
+      const h = hits[r.sid];
+      if (!h || !h.hits.length) return r;
+      const first = h.hits[0];
+      return Object.assign({}, r, { preview: "🔎 " + (first.role === "user" ? "你：" : "") + first.snippet });
+    });
+  }
   if (!shown.length) {
-    listEl.innerHTML = '<div class="empty-hint">' + (q ? "沒有符合的聊天室" : "這個專案還沒有聊天室") + "</div>";
+    listEl.innerHTML = '<div class="empty-hint">' + (q ? (q.length >= 2 && searchHits.q !== q ? "搜尋對話內容中…" : "沒有符合的聊天室") : "這個專案還沒有聊天室") + "</div>";
     return;
   }
   listEl.innerHTML = "";
@@ -267,6 +296,7 @@ function renderRooms() {
           '<span class="tag">' + esc(r.project_name) + "</span>" +
           (r.archived ? '<span class="tag arch">封存</span>' : "") +
           (r.live ? '<span class="tag live">桌機開著</span>' : "") +
+          (eng === "claude" && r.app && !r.desktop ? '<span class="tag phone">只在手機</span>' : "") +
         "</div>" +
       "</div>";
     const wrap = document.createElement("div");
@@ -375,11 +405,43 @@ function openActions(r) {
   actionRoom = r;
   $("#action-title").textContent = r.title;
   $("#btn-archive").textContent = r.archived ? "📤 解除封存" : "📥 封存（從清單收起來，紀錄還在）";
+  const isClaude = (r.engine || "claude") === "claude";
+  $("#btn-desktop").classList.toggle("hidden", !isClaude || !serverInfo.desktop_app || serverInfo.desktop_sync === "off");
+  $("#btn-desktop").textContent = r.desktop ? "🖥 在桌面 App 打開" : "🖥 同步到桌面 App 並打開";
   $("#sheet-actions").classList.remove("hidden");
 }
 
 $("#btn-archive").onclick = () => { if (actionRoom) doArchive(actionRoom); };
 $("#btn-delete").onclick = () => { if (actionRoom) doDelete(actionRoom); };
+$("#btn-desktop").onclick = async () => {
+  const r = actionRoom;
+  if (!r) return;
+  $("#sheet-actions").classList.add("hidden");
+  try {
+    const d = await api("/api/room/" + r.slug + "/" + r.sid + "/desktop", { method: "POST" });
+    sysNote(d.result === "imported" ? "已登錄進桌面 App，電腦那邊已切到這個對話" : "桌面 App 已切到這個對話");
+    setTimeout(() => loadRooms(true), 3000);
+  } catch (e) {
+    sysNote("同步失敗：" + e.message, true);
+  }
+};
+$("#btn-rename").onclick = async () => {
+  const r = actionRoom;
+  if (!r) return;
+  const t = prompt("聊天室名字（清空 = 還原成原本的）", r.title || "");
+  if (t === null) return;
+  $("#sheet-actions").classList.add("hidden");
+  try {
+    await api("/api/room/" + r.slug + "/" + r.sid + "/title", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: t.trim() }),
+    });
+    if (current && current.sid === r.sid) $("#chat-title").textContent = t.trim() || r.title;
+    loadRooms(true);
+  } catch (e) {
+    sysNote("改名失敗：" + e.message, true);
+  }
+};
 
 /* ---------- 進出聊天室 ---------- */
 /* 上下文用量條 */
@@ -526,6 +588,8 @@ function hideTyping() { if (typingEl) { typingEl.remove(); typingEl = null; } }
 /* ---------- 附件上傳 ---------- */
 let attachments = [];   // {path, name, url, uploading}
 
+const isImagePath = (p) => /\.(png|jpe?g|gif|webp)$/i.test(p || "");
+
 function renderAttachStrip() {
   const strip = $("#attach-strip");
   if (!attachments.length) { strip.classList.add("hidden"); strip.innerHTML = ""; return; }
@@ -534,7 +598,9 @@ function renderAttachStrip() {
   attachments.forEach((a, i) => {
     const el = document.createElement("div");
     el.className = "attach-item" + (a.uploading ? " uploading" : "");
-    el.innerHTML = '<img src="' + a.url + '"><div class="rm">✕</div>';
+    el.innerHTML = (isImagePath(a.name) ? '<img src="' + a.url + '">'
+      : '<div class="doc">📄<span>' + esc((a.name || "").split(".").pop().toUpperCase()) + "</span></div>") +
+      '<div class="rm">✕</div>';
     el.querySelector(".rm").onclick = () => { attachments.splice(i, 1); renderAttachStrip(); };
     strip.appendChild(el);
   });
@@ -556,7 +622,7 @@ $("#file-input").addEventListener("change", async (e) => {
       item.uploading = false;
     } catch (err) {
       attachments = attachments.filter((x) => x !== item);
-      sysNote("圖片上傳失敗：" + err.message, true);
+      sysNote("上傳失敗：" + err.message, true);
     }
     renderAttachStrip();
   }
@@ -570,7 +636,7 @@ async function sendMsg() {
   if (attachments.some((a) => a.uploading)) { sysNote("圖片還在上傳，等一下再送"); return; }
   const paths = attachments.map((a) => a.path).filter(Boolean);
   if (paths.length) {
-    const lines = paths.map((p) => "[手機傳圖，請用 Read 工具查看: " + p + "]");
+    const lines = paths.map((p) => (isImagePath(p) ? "[手機傳圖，請用 Read 工具查看: " : "[手機傳檔，請用 Read 工具讀取: ") + p + "]");
     text = (text ? text + "\n\n" : "") + lines.join("\n");
   }
   attachments = [];
@@ -634,6 +700,17 @@ function attachRun(runId, from, isReattach) {
     }
     if (it.kind === "ask_done") {
       lockAskCard(it.ask_id, null);
+      return;
+    }
+    if (it.kind === "perm") {
+      hideTyping();
+      renderPermCard(it);
+      showTyping();
+      scrollBottom();
+      return;
+    }
+    if (it.kind === "perm_done") {
+      lockPermCard(it.perm_id, it.decision === "allow" ? "已允許" : "已拒絕");
       return;
     }
     if (it.kind === "tool_ok") {
@@ -783,6 +860,47 @@ function lockAskCard(askId, note) {
   if (!card || card.classList.contains("done")) return;
   card.classList.add("done");
   card.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
+  if (note) {
+    const n = document.createElement("div");
+    n.className = "ask-note";
+    n.textContent = note;
+    card.appendChild(n);
+  }
+}
+
+/* ---------- 逐項授權卡（先問我模式） ---------- */
+function renderPermCard(it) {
+  const card = document.createElement("div");
+  card.className = "msg ai ask-card perm-card";
+  card.dataset.permId = it.perm_id;
+  card.innerHTML =
+    '<div class="ask-head">🔐 它想做這件事，可以嗎？</div>' +
+    '<div class="ask-tag">' + esc(it.tool || "工具") + "</div>" +
+    (it.detail ? '<div class="ask-question">' + esc(it.detail) + "</div>" : "") +
+    (it.preview && it.preview !== it.detail ? '<pre class="perm-preview">' + esc(it.preview) + "</pre>" : "") +
+    '<div class="perm-btns">' +
+      '<button class="ask-opt perm-allow"><b>允許</b></button>' +
+      '<button class="ask-opt perm-deny"><b>拒絕</b></button>' +
+    "</div>" +
+    '<button class="ask-skip perm-all">這次工作剩下的全部允許（不再問）</button>';
+  const submit = (decision) => {
+    api("/api/perm/" + it.perm_id + "/answer", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    }).catch(() => {});
+    lockPermCard(it.perm_id, decision === "deny" ? "已拒絕" : decision === "allow_all" ? "已允許（之後不再問）" : "已允許");
+  };
+  card.querySelector(".perm-allow").onclick = () => submit("allow");
+  card.querySelector(".perm-deny").onclick = () => submit("deny");
+  card.querySelector(".perm-all").onclick = () => submit("allow_all");
+  msgsEl.appendChild(card);
+}
+
+function lockPermCard(permId, note) {
+  const card = msgsEl.querySelector('.perm-card[data-perm-id="' + permId + '"]');
+  if (!card || card.classList.contains("done")) return;
+  card.classList.add("done");
+  card.querySelectorAll("button").forEach((el) => { el.disabled = true; });
   if (note) {
     const n = document.createElement("div");
     n.className = "ask-note";
@@ -1107,7 +1225,22 @@ $("#btn-settings").onclick = async () => {
   };
   try {
     const h = await api("/api/health");
-    $("#health-line").textContent = "伺服器正常 · " + h.claude;
+    serverInfo = h;
+    $("#health-line").textContent = "伺服器正常 · " + h.claude +
+      (h.desktop_app ? " · 桌面 App：有" + (h.desktop_registry ? "（登錄檔已對上）" : "") : " · 桌面 App：沒裝");
+    $("#desktop-sync-opts").classList.toggle("hidden", !h.desktop_app);
+    document.querySelectorAll('input[name="dsync"]').forEach((r) => {
+      r.checked = r.value === h.desktop_sync;
+      r.onchange = async () => {
+        try {
+          const d = await api("/api/settings", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ desktop_sync: r.value }),
+          });
+          serverInfo.desktop_sync = d.desktop_sync;
+        } catch (e) { sysNote("設定沒存成功：" + e.message, true); }
+      };
+    });
   } catch (e) {
     $("#health-line").textContent = "伺服器連不上：" + e.message;
   }

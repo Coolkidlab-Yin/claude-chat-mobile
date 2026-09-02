@@ -3,5 +3,6 @@
   "auth_token": "",
   "default_mode": "plan",
   "allow_home_reads": false,
-  "extra_file_roots": []
+  "extra_file_roots": [],
+  "desktop_sync": "manual"
 }

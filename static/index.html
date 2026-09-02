@@ -49,8 +49,8 @@
   <div id="jump-bottom" class="jump-bottom hidden">↓</div>
   <div id="attach-strip" class="attach-strip hidden"></div>
   <div class="composer">
-    <button id="btn-attach" class="attach-btn" title="傳圖片">＋</button>
-    <input id="file-input" type="file" accept="image/*" multiple class="hidden">
+    <button id="btn-attach" class="attach-btn" title="傳圖片或文件">＋</button>
+    <input id="file-input" type="file" accept="image/*,.pdf,.txt,.md,.csv,.json" multiple class="hidden">
     <button id="btn-mic" class="attach-btn mic" title="語音輸入">🎙</button>
     <textarea id="input" rows="1" placeholder="輸入訊息…" enterkeyhint="send"></textarea>
     <button id="btn-send" class="send-btn">↑</button>
@@ -81,6 +81,8 @@
   <div class="sheet">
     <div id="action-title" class="sheet-title">聊天室</div>
     <div class="mode-opts">
+      <button id="btn-desktop" class="action-btn">🖥 在桌面 App 打開</button>
+      <button id="btn-rename" class="action-btn">✏️ 改名</button>
       <button id="btn-archive" class="action-btn">📥 封存</button>
       <button id="btn-delete" class="action-btn danger">🗑 刪除（移到垃圾桶）</button>
     </div>
@@ -161,6 +163,10 @@
         <div><b>全自動</b><span>Claude 可以直接查資料、改檔案、跑指令，不會一件一件問你。手機遙控用這個最順。</span></div>
       </label>
       <label class="mode-opt">
+        <input type="radio" name="mode" value="ask">
+        <div><b>先問我</b><span>跟桌面 app 的「手動」一樣：Claude 要跑指令、改檔案、抓網頁之前，手機會跳出「允許／拒絕」讓你決定；可以按「這次工作全部允許」省事。查資料不用問。</span></div>
+      </label>
+      <label class="mode-opt">
         <input type="radio" name="mode" value="edits">
         <div><b>只准改檔案</b><span>Claude 可以讀和改檔案，但跑指令之類的動作會被擋下來，它會告訴你它被擋了。</span></div>
       </label>
@@ -175,6 +181,16 @@
       <input type="checkbox" id="chk-all">
       <div><b>顯示全部（含封存與排程機器人）</b><span>平常只顯示跟桌面 app 一樣的清單＋手機上開的對話。打開這個會把已封存的舊對話和自動排程的機器人紀錄也列出來。</span></div>
     </label>
+
+    <div class="setting-label">同步到桌面 App（這台電腦的 Claude 桌面 app）</div>
+    <div class="mode-opts compact" id="desktop-sync-opts">
+      <label class="mode-opt"><input type="radio" name="dsync" value="auto">
+        <div><b>自動</b><span>手機上開的新對話，做完第一輪就自動登錄進桌面 app；之後坐回電腦直接在桌面 app 接著聊。桌面 app 當下會切到那個對話一次。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="dsync" value="manual">
+        <div><b>手動</b><span>只有你長按聊天室 → 「在桌面 App 打開」時才登錄。</span></div></label>
+      <label class="mode-opt"><input type="radio" name="dsync" value="off">
+        <div><b>關閉</b><span>不跟桌面 app 互動（沒裝桌面 app 的電腦用這個）。</span></div></label>
+    </div>
 
     <div id="health-line" class="setting-note"></div>
     <button class="sheet-cancel" data-close="sheet-settings">關閉</button>
