@@ -691,6 +691,10 @@ function attachRun(runId, from, isReattach) {
       setCtx(it);
       return;
     }
+    if (it.kind === "note") {
+      sysNote(it.text);
+      return;
+    }
     if (it.kind === "ask") {
       hideTyping();
       renderAskCard(it);
