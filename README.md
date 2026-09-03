@@ -90,7 +90,7 @@ Swipe left on a room (or long-press / right-click) to reveal **Archive** and **D
 
 **File preview:**
 
-Windows-style file paths that show up in a reply (e.g. `C:\Users\you\Desktop\screenshot.png`) are automatically turned into inline previews — images render inline, video and audio get a player. Anything that a browser could execute as a page (HTML, SVG, XML, JS) is always sent as a download instead, so a file the agent generated can't run as script inside this app's origin.
+Files the agent hands over with the desktop app's SendUserFile tool are shown too (the tool call is turned into a text line with the caption and the full paths). Windows-style file paths that show up in a reply (e.g. `C:\Users\you\Desktop\screenshot.png`) are automatically turned into inline previews — images render inline, video and audio get a player. Anything that a browser could execute as a page (HTML, SVG, XML, JS) is always sent as a download instead, so a file the agent generated can't run as script inside this app's origin.
 
 This is served by `GET /api/file?path=...`, which only reads from an allow-list:
 

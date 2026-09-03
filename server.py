@@ -385,6 +385,14 @@ def items_from_message(role, message, ts=None, tool_status=None):
             if tool_status is not None and b.get("id") in tool_status:
                 item["ok"] = tool_status[b.get("id")]
             items.append(item)
+            # 桌面 app 的「傳檔案給使用者」卡片手機看不到（工具輸入是 files 陣列，
+            # 內文又常只寫檔名），把路徑補成一則文字讓前端變成內嵌播放器/圖片
+            if name == "SendUserFile" and isinstance(b.get("input"), dict):
+                files = [f for f in (b["input"].get("files") or []) if isinstance(f, str)]
+                if files:
+                    cap = b["input"].get("caption")
+                    lines = ([cap.strip()] if isinstance(cap, str) and cap.strip() else []) + files
+                    items.append({"role": "assistant", "kind": "text", "text": "\n".join(lines), "ts": ts})
     return items
 
 
