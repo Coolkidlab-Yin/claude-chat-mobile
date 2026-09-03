@@ -1567,6 +1567,10 @@ def live_peer_for(sid):
             pid = d.get("pid")
             if not pid or pid == os.getpid() or not _pid_alive(pid):
                 continue
+            # pid 會被 Windows 回收再用：登記檔的 procStart 要跟現在那個行程的建立時間一致才算同一隻
+            ps = d.get("procStart")
+            if ps and str(ps) != _proc_start_ft(pid):
+                continue
             keys = list(LIVE_DIR.glob(f"{pid}.*.key"))
             if not keys:
                 continue
@@ -1601,8 +1605,9 @@ PEER_IDLE_GAP = 2.5       # end_turn 之後再安靜幾秒才算做完
 PEER_MAX_TAIL = 45 * 60
 
 
-async def run_peer(run, text, peer, path):
-    """把訊息直送進桌面開著的那個行程，然後尾讀 jsonl 把它的回覆播到手機。"""
+async def run_peer(run, text, peer, path, fallback=None):
+    """把訊息直送進桌面開著的那個行程，然後尾讀 jsonl 把它的回覆播到手機。
+    pipe 開不起來（登記檔過期、行程剛死）→ 退回原本的 claude -p --resume（fallback=(mode, extra)）。"""
     msg_id = str(uuid.uuid4())
     me = "uds:" + _peer["sock"]
     wrapped = (f'<cross-session-message from="{me}" from-name="{PEER_NAME}" '
@@ -1614,14 +1619,25 @@ async def run_peer(run, text, peer, path):
     except OSError:
         offset = 0
     await _emit(run, {"kind": "init", "sid": run.sid})
-    await _emit(run, {"kind": "note", "text": "這個對話在桌面 App 開著：訊息直接送進桌面那邊，回覆由桌面產生（模型/力度設定以桌面為準）"})
     try:
-        await asyncio.to_thread(_pipe_send, peer["sock"], [
-            {"type": "auth", "token": peer["token"]},
-            {"msgV": 1, "msg_id": msg_id, "type": "user",
-             "message": {"role": "user", "content": wrapped},
-             "priority": "next", "from": me},
-        ])
+        try:
+            await asyncio.to_thread(_pipe_send, peer["sock"], [
+                {"type": "auth", "token": peer["token"]},
+                {"msgV": 1, "msg_id": msg_id, "type": "user",
+                 "message": {"role": "user", "content": wrapped},
+                 "priority": "next", "from": me},
+            ])
+        except OSError as e:
+            # 登記檔還在但 pipe 已經不見（行程剛結束/卡死）→ 當作桌面沒開著，走原本的路
+            log.warning("peer pipe unusable for %s (%s); falling back to claude -p", run.sid, e)
+            _peer["status"].pop(msg_id, None)
+            if fallback is None:
+                raise
+            run.peer = False
+            mode, extra = fallback
+            await run_claude(run, text, mode, extra)
+            return
+        await _emit(run, {"kind": "note", "text": "這個對話在桌面 App 開著：訊息直接送進桌面那邊，回覆由桌面產生（模型/力度設定以桌面為準）"})
         try:
             status = await asyncio.wait_for(fut, 6)
         except asyncio.TimeoutError:
@@ -2491,6 +2507,12 @@ async def send(body: SendBody):
         asyncio.get_event_loop().create_task(run_codex(run, text, mode))
         return {"run_id": run.id}
 
+    extra = []
+    if body.model in MODELS:
+        extra += ["--model", MODELS[body.model]]
+    if body.effort in EFFORTS:
+        extra += ["--effort", body.effort]
+
     # 桌面 app 正開著這個對話 → 直送進那個行程，不另起第二個行程搶同一份紀錄
     peer = live_peer_for(body.sid) if body.sid else None
     if peer:
@@ -2498,14 +2520,8 @@ async def send(body: SendBody):
         run.peer = True
         RUNS[run.id] = run
         BY_SESSION[body.sid] = run.id
-        asyncio.get_event_loop().create_task(run_peer(run, text, peer, f))
+        asyncio.get_event_loop().create_task(run_peer(run, text, peer, f, fallback=(mode, extra)))
         return {"run_id": run.id, "peer": True}
-
-    extra = []
-    if body.model in MODELS:
-        extra += ["--model", MODELS[body.model]]
-    if body.effort in EFFORTS:
-        extra += ["--effort", body.effort]
 
     run = Run(uuid.uuid4().hex[:12], body.slug, body.sid, cwd)
     RUNS[run.id] = run
