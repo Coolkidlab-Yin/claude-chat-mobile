@@ -2379,6 +2379,7 @@ class PermBody(BaseModel):
     run_id: str
     tool_name: str = ""
     tool_input: dict = {}
+    reason: str = ""   # 例如危險指令攔截 hook 給的說明，卡片上會用警示樣式顯示
 
 
 class PermAnswerBody(BaseModel):
@@ -2404,7 +2405,7 @@ async def perm_open(body: PermBody):
                 preview = v[:600]
                 break
     await _emit(run, {"kind": "perm", "perm_id": perm_id, "tool": body.tool_name,
-                      "detail": detail, "preview": preview})
+                      "detail": detail, "preview": preview, "reason": (body.reason or "")[:800]})
     return {"perm_id": perm_id}
 
 

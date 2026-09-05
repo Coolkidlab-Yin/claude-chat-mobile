@@ -11,13 +11,16 @@
  * Only active for runs started by claude-chat-mobile: server.py passes this
  * file through `--settings` solely in "ask" mode, and the hook exits 0 (no
  * opinion) unless CLAUDE_CHAT_RUN_ID is set. Desktop app / plain CLI unaffected.
+ *
+ * Also usable as a library: other hooks (e.g. a dangerous-command guard that
+ * would normally answer "ask") can `require()` this file and call
+ * `askPhone({tool_name, tool_input, reason})` to turn their "ask" into a card
+ * on the phone. Resolves to "allow" | "deny" | "timeout" | "unavailable".
  */
 "use strict";
 
 const RUN_ID = process.env.CLAUDE_CHAT_RUN_ID;
 const PORT = process.env.CLAUDE_CHAT_PORT || "8899";
-if (!RUN_ID) process.exit(0);
-
 const BASE = "http://127.0.0.1:" + PORT;
 const WAIT_TOTAL_MS = 9.5 * 60 * 1000; // stay under the hook timeout (600s)
 // tools that are always fine without asking
@@ -45,7 +48,39 @@ function reply(decision, reason) {
   );
 }
 
+/** Ask the phone. Never throws; "unavailable" when this is not a phone run or the server is unreachable. */
+async function askPhone({ tool_name, tool_input, reason }) {
+  if (!RUN_ID) return "unavailable";
+  let permId;
+  try {
+    const r = await fetch(BASE + "/api/perm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: RUN_ID, tool_name: tool_name || "", tool_input: tool_input || {}, reason: reason || "" }),
+    });
+    if (!r.ok) return "unavailable";
+    const d = await r.json();
+    if (d.decision === "allow") return "allow";
+    permId = d.perm_id;
+  } catch {
+    return "unavailable";
+  }
+  const deadline = Date.now() + WAIT_TOTAL_MS;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(BASE + "/api/perm/" + permId);
+      if (!r.ok) return "unavailable";
+      const d = await r.json();
+      if (d.decision === "allow" || d.decision === "deny") return d.decision;
+    } catch {
+      return "unavailable";
+    }
+  }
+  return "timeout";
+}
+
 async function main() {
+  if (!RUN_ID) process.exit(0);
   let payload;
   try {
     payload = JSON.parse(await readStdin());
@@ -57,41 +92,8 @@ async function main() {
     reply("allow", "claude-chat 內建通道");
     process.exit(0);
   }
-
-  let permId;
-  try {
-    const r = await fetch(BASE + "/api/perm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: RUN_ID, tool_name: tool, tool_input: payload.tool_input || {} }),
-    });
-    if (!r.ok) process.exit(0); // server unreachable → no opinion (Claude Code's default applies)
-    const d = await r.json();
-    if (d.decision === "allow") {
-      reply("allow", "使用者已選擇「這次工作全部允許」");
-      process.exit(0);
-    }
-    permId = d.perm_id;
-  } catch {
-    process.exit(0);
-  }
-
-  const deadline = Date.now() + WAIT_TOTAL_MS;
-  let decision = null;
-  while (Date.now() < deadline) {
-    try {
-      const r = await fetch(BASE + "/api/perm/" + permId);
-      if (!r.ok) break;
-      const d = await r.json();
-      if (d.decision) {
-        decision = d.decision;
-        break;
-      }
-    } catch {
-      break;
-    }
-  }
-
+  const decision = await askPhone({ tool_name: tool, tool_input: payload.tool_input || {} });
+  if (decision === "unavailable") process.exit(0); // no opinion → Claude Code's default applies
   if (decision === "allow") {
     reply("allow", "使用者在手機上允許了這個動作");
   } else {
@@ -105,4 +107,8 @@ async function main() {
   process.exit(0);
 }
 
-main().catch(() => process.exit(0));
+module.exports = { askPhone };
+
+if (require.main === module) {
+  main().catch(() => process.exit(0));
+}

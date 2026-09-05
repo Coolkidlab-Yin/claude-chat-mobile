@@ -878,7 +878,8 @@ function renderPermCard(it) {
   card.className = "msg ai ask-card perm-card";
   card.dataset.permId = it.perm_id;
   card.innerHTML =
-    '<div class="ask-head">🔐 它想做這件事，可以嗎？</div>' +
+    '<div class="ask-head">' + (it.reason ? "⚠️ 危險指令，要放行嗎？" : "🔐 它想做這件事，可以嗎？") + "</div>" +
+    (it.reason ? '<div class="perm-reason">' + esc(it.reason) + "</div>" : "") +
     '<div class="ask-tag">' + esc(it.tool || "工具") + "</div>" +
     (it.detail ? '<div class="ask-question">' + esc(it.detail) + "</div>" : "") +
     (it.preview && it.preview !== it.detail ? '<pre class="perm-preview">' + esc(it.preview) + "</pre>" : "") +
