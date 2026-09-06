@@ -285,13 +285,13 @@ function renderRooms() {
     el.innerHTML =
       '<div class="avatar' + (eng !== "claude" ? " eng-" + eng : "") + '" style="--h:' + h + '">' +
         esc(eng === "claude" ? initial : (ENGINE_ICON[eng] || "?")) +
-        (r.running ? '<span class="dot"></span>' : "") +
+        (r.running || r.busy ? '<span class="dot"></span>' : "") +
       "</div>" +
       '<div class="room-main">' +
         '<div class="room-top"><div class="room-title">' + esc(r.title) + '</div>' +
         '<div class="room-time">' + fmtTime(r.ts) + "</div></div>" +
         '<div class="room-bottom">' +
-          '<div class="room-preview">' + esc(r.running ? "正在工作中…" : r.preview || "") + "</div>" +
+          '<div class="room-preview">' + esc(r.running ? "正在工作中…" : r.busy ? "桌面工作中… " + (r.preview || "") : r.preview || "") + "</div>" +
           (eng !== "claude" ? '<span class="tag eng">' + esc(ENGINE_NAME[eng] || eng) + "</span>" : "") +
           '<span class="tag">' + esc(r.project_name) + "</span>" +
           (r.archived ? '<span class="tag arch">封存</span>' : "") +
@@ -455,6 +455,66 @@ function setCtx(c) {
   $("#ctx-label").textContent = "上下文 " + fmtTok(c.tokens) + " / " + fmtTok(c.window) + " · " + c.pct + "%";
 }
 
+/* ---------- 旁觀桌面正在跑的對話（尾讀 jsonl） ---------- */
+let watchTimer = null;
+let watchOffset = 0;
+let watchBusy = false;
+
+function applyTailItems(items) {
+  for (const it of items) {
+    if (it.kind === "ctx") { setCtx(it); continue; }
+    if (it.kind === "tool_ok") {
+      const chip = toolChips[it.tool_use_id];
+      if (chip) {
+        const st = chip.querySelector(".t-state");
+        if (st) { st.className = "t-state " + (it.ok ? "ok" : "bad"); st.textContent = it.ok ? "✓" : "✕"; }
+      }
+      continue;
+    }
+    hideTyping();
+    it.ts = it.ts || Date.now();
+    msgsEl.appendChild(renderItem(it));
+    scrollBottom();
+  }
+}
+
+function stopWatch() {
+  if (watchTimer) { clearInterval(watchTimer); watchTimer = null; }
+  if (watchBusy) { watchBusy = false; hideTyping(); if (current) setSub(""); }
+}
+
+function startWatch() {
+  stopWatch();
+  if (!current || !current.sid || !current.slug || activeRun) return;
+  if ((current.engine || "claude") !== "claude") return;
+  const sid = current.sid;
+  const tick = async () => {
+    if (!current || current.sid !== sid || activeRun || document.hidden) return;
+    let d;
+    try {
+      d = await api("/api/tail/" + current.slug + "/" + sid + "?offset=" + watchOffset);
+    } catch (e) { return; }
+    if (!current || current.sid !== sid || activeRun) return;
+    if (d.running) {
+      // 手機這邊起的工作（例如背景重連）→ 交給事件流
+      const st = await api("/api/status").catch(() => null);
+      const info = st && st.running[sid];
+      if (info) { attachRun(info.run_id, info.n_events, true); return; }
+    }
+    watchOffset = d.offset;
+    if (d.items && d.items.length) applyTailItems(d.items);
+    if (d.busy !== watchBusy) {
+      watchBusy = d.busy;
+      if (d.busy) { setSub("桌面工作中…"); showTyping(); scrollBottom(); }
+      else { hideTyping(); setSub(""); }
+    } else if (d.busy && d.items && d.items.length) {
+      showTyping(); scrollBottom();
+    }
+  };
+  watchTimer = setInterval(tick, 2500);
+  tick();
+}
+
 function openRoom(room, fromPop) {
   current = Object.assign({}, room);
   toolChips = {};
@@ -470,11 +530,12 @@ function openRoom(room, fromPop) {
   stickBottom = true;
   if (room.sid) {
     loadHistory().then(() => {
-      // 若這個房間有背景工作進行中 → 接上事件流
+      // 若這個房間有背景工作進行中 → 接上事件流；否則旁觀桌面那邊的進度
       api("/api/status").then((st) => {
         const info = st.running[current && current.sid];
         if (info) attachRun(info.run_id, info.n_events, true);
-      }).catch(() => {});
+        else startWatch();
+      }).catch(() => startWatch());
     });
   } else {
     msgsEl.innerHTML = '<div class="sys-note">新聊天室（' + esc(room.project_name) + '）— 送出第一句就開始</div>';
@@ -483,6 +544,7 @@ function openRoom(room, fromPop) {
 
 function closeRoom() {
   chatScreen.classList.add("hidden-right");
+  stopWatch();
   detachRun(false);
   current = null;
   loadRooms(true);
@@ -514,6 +576,7 @@ async function loadHistory(before) {
     (before != null ? "?before=" + before : "");
   const data = await api(url);
   if (before == null && data.context) setCtx(data.context);
+  if (before == null && typeof data.size === "number") watchOffset = data.size;
   const frag = document.createDocumentFragment();
   if (data.more) {
     const btn = document.createElement("div");
@@ -672,6 +735,7 @@ async function sendMsg() {
 }
 
 function attachRun(runId, from, isReattach) {
+  stopWatch();
   detachRun(true);
   const es = new EventSource("/api/run/" + runId + "/events?start=" + (from || 0));
   activeRun = { id: runId, es };
@@ -775,7 +839,9 @@ async function finishRun(doneEv) {
     if (found) { current.slug = found.slug; $("#chat-title").textContent = found.title; }
   }
   if (current.slug && current.sid) {
-    setTimeout(() => { if (current && !activeRun) loadHistory().catch(() => {}); }, 400);
+    setTimeout(() => {
+      if (current && !activeRun) loadHistory().then(() => startWatch()).catch(() => {});
+    }, 400);
   }
   loadRooms(true);
 }
@@ -1267,7 +1333,7 @@ document.addEventListener("visibilitychange", () => {
       api("/api/status").then((st) => {
         const info = st.running[current.sid];
         if (info) attachRun(info.run_id, info.n_events, true);
-        else loadHistory().catch(() => {});
+        else loadHistory().then(() => startWatch()).catch(() => {});
       }).catch(() => {});
     }
   }

@@ -828,7 +828,7 @@ def api_rooms():
     return rooms
 
 
-def _merge_compact_generations(infos):
+def _merge_compact_generations(infos, live=frozenset()):
     """把同一場對話的多個 compact 世代併成一列。
 
     每次 /compact（或自動壓縮）Claude Code 都會換一個新的 session id、
@@ -853,9 +853,12 @@ def _merge_compact_generations(infos):
         if len(gen_list) == 1:
             out.append(gen_list[0])
             continue
-        # 最新世代代表這場對話：點進去接續的必須是它，接到舊世代等於回到 compact 前
+        # 最新世代代表這場對話：點進去接續的必須是它，接到舊世代等於回到 compact 前。
+        # 桌面正開著其中一個世代（有活著的行程）時一律以它為準：手機訊息才會直送進那個行程、
+        # 旁觀進度也才尾讀到正在寫的那個檔。
         gen_list.sort(key=lambda x: x["last_epoch"], reverse=True)
-        newest = dict(gen_list[0])
+        live_gen = next((g for g in gen_list if g["sid"] in live), None)
+        newest = dict(live_gen or gen_list[0])
         newest["generations"] = len(gen_list)
         newest["gen_sids"] = [g["sid"] for g in gen_list]
         out.append(newest)
@@ -869,7 +872,8 @@ def scan_rooms(show_all=False):
     可見 = 桌面未封存 + 一般 CLI 對話 + 快照之後的新桌面對話；
     隱藏 = 已封存、排程機器人(sdk-cli)、舊桌面殘檔。
     """
-    infos = _merge_compact_generations(_file_infos())
+    live = live_session_ids()
+    infos = _merge_compact_generations(_file_infos(), live)
     snap = load_snapshot()
     sessions = snap.get("sessions", {})
     gen_at = snap.get("generated_at", 0)
@@ -912,7 +916,6 @@ def scan_rooms(show_all=False):
         assigned[fsid] = rid
         used_reg.add(rid)
 
-    live = live_session_ids()
     overlay = load_overlay()
     app_sids = load_app_sids()
     rooms = []
@@ -957,6 +960,7 @@ def scan_rooms(show_all=False):
         room["engine"] = "claude"
         room["desktop"] = bool(reg)                      # 桌面 app 登錄裡有它
         room["app"] = any(x in app_sids for x in sids)   # 是從手機開的
+        room["busy"] = (time.time() - fi["mtime"]) < BUSY_WINDOW   # 桌面那邊正在寫＝工作中
         rooms.append(room)
 
     for extra in codex_rooms() + api_rooms():
@@ -1114,7 +1118,72 @@ def load_history(path, before=None, limit=120):
             break
     items.reverse()
     return {"items": items, "oldest": (items[0]["i"] if items else 0),
-            "more": not reached_start, "context": context}
+            "more": not reached_start, "context": context, "size": size}
+
+
+BUSY_WINDOW = 15.0   # jsonl 幾秒內有寫入就當「桌面正在工作」
+
+
+def _room_busy(path):
+    try:
+        return time.time() - path.stat().st_mtime < BUSY_WINDOW
+    except OSError:
+        return False
+
+
+def tail_items(path, offset):
+    """從 offset 讀新寫入的紀錄（只吃完整的行），轉成前端可播的 items。回 (items, new_offset)。
+    桌面正在跑的 session 也能在手機上即時看進度（工具呼叫、背景工作通知、回覆）。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], offset
+    if size < offset:
+        offset = 0          # 檔案被換掉/截短，從頭算
+    if size == offset:
+        return [], offset
+    with open(path, "rb") as f:
+        f.seek(offset)
+        chunk = f.read(size - offset)
+    nl = chunk.rfind(b"\n")
+    if nl < 0:
+        return [], offset
+    items = []
+    tool_status = {}
+    for line in chunk[:nl].decode("utf-8", "replace").splitlines():
+        rec = _loads(line)
+        if not rec or rec.get("isSidechain"):
+            continue
+        rt = rec.get("type")
+        ts = rec.get("timestamp")
+        msg = rec.get("message") or {}
+        if rt == "user":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        ok = not b.get("is_error", False)
+                        tool_status[b.get("tool_use_id")] = ok
+                        items.append({"kind": "tool_ok", "tool_use_id": b.get("tool_use_id"), "ok": ok})
+            text = _text_of(content)
+            if rec.get("isCompactSummary"):
+                items.append({"role": "user", "kind": "info", "text": text, "label": "前情摘要", "ts": ts})
+            elif text.strip():
+                if text.lstrip().startswith("<task-notification>"):
+                    items.append({"role": "user", "kind": "info", "text": text, "label": "背景工作回報", "ts": ts})
+                elif not _is_meta_user(rec, text):
+                    items.append({"role": "user", "kind": "text", "text": text, "ts": ts})
+        elif rt == "assistant":
+            for it in items_from_message("assistant", msg, ts, tool_status):
+                items.append(it)
+            u = msg.get("usage")
+            if isinstance(u, dict):
+                tok = ((u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+                       + (u.get("cache_creation_input_tokens") or 0))
+                if tok > 0:
+                    win = _ctx_window(msg.get("model"), tok)
+                    items.append({"kind": "ctx", "tokens": tok, "window": win, "pct": round(tok * 100 / win)})
+    return items, offset + nl + 1
 
 
 # ---------- 執行 claude ----------
@@ -2005,7 +2074,19 @@ def history(slug: str, sid: str, before: int | None = None, limit: int = 120):
     out["running_run_id"] = BY_SESSION.get(sid)
     run = RUNS.get(out["running_run_id"]) if out["running_run_id"] else None
     out["n_events"] = len(run.events) if run else 0
+    out["busy"] = (not eng) and _room_busy(f)
     return out
+
+
+@app.get("/api/tail/{slug}/{sid}")
+def tail(slug: str, sid: str, offset: int = 0):
+    """手機旁觀桌面正在跑的對話：回 offset 之後的新內容＋它是不是還在忙。"""
+    f = find_room_file(slug, sid)
+    if SLUG_ENGINE.get(slug):
+        return {"items": [], "offset": offset, "busy": False, "live": False}
+    items, new_off = tail_items(f, max(0, offset))
+    return {"items": items, "offset": new_off, "busy": _room_busy(f),
+            "live": live_peer_for(sid) is not None, "running": sid in BY_SESSION}
 
 
 def _ctx_window(model, tokens):
