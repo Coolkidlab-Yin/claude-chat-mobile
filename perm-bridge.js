@@ -48,45 +48,144 @@ function reply(decision, reason) {
   );
 }
 
-/** Ask the phone. Never throws; "unavailable" when this is not a phone run or the server is unreachable. */
-async function askPhone({ tool_name, tool_input, reason }) {
-  if (!RUN_ID) return "unavailable";
+async function postAnswer(permId, decision, by) {
+  try {
+    await fetch(BASE + "/api/perm/" + permId + "/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision, by: by || "" }),
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Ask the phone. Never throws.
+ * - Phone-started run (CLAUDE_CHAT_RUN_ID set): the card belongs to that run and decides.
+ * - Otherwise pass `session_id` (from the hook's stdin payload): the card is registered for that
+ *   desktop/CLI session (list banner + inside the room). With `notifyOnly` the call returns "ask"
+ *   right away so the desktop app shows its own dialog too; the card stays on the phone and the
+ *   claude-chat server answers the desktop dialog on the user's behalf when they tap it.
+ * Resolves to "allow" | "deny" | "ask" | "timeout" | "unavailable".
+ */
+async function askPhone({ tool_name, tool_input, reason, session_id, cwd, waitMs, notifyOnly }) {
+  if (!RUN_ID && !session_id) return "unavailable";
   let permId;
   try {
     const r = await fetch(BASE + "/api/perm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: RUN_ID, tool_name: tool_name || "", tool_input: tool_input || {}, reason: reason || "" }),
+      body: JSON.stringify({
+        run_id: RUN_ID || "",
+        session_id: RUN_ID ? "" : session_id || "",
+        cwd: cwd || "",
+        tool_name: tool_name || "",
+        tool_input: tool_input || {},
+        reason: reason || "",
+        notify_only: !!notifyOnly,
+      }),
     });
     if (!r.ok) return "unavailable";
     const d = await r.json();
     if (d.decision === "allow") return "allow";
     permId = d.perm_id;
+    if (!permId) return "unavailable";
   } catch {
     return "unavailable";
   }
-  const deadline = Date.now() + WAIT_TOTAL_MS;
+  if (notifyOnly) return "ask";
+
+  const deadline = Date.now() + (waitMs || WAIT_TOTAL_MS);
   while (Date.now() < deadline) {
     try {
       const r = await fetch(BASE + "/api/perm/" + permId);
       if (!r.ok) return "unavailable";
       const d = await r.json();
       if (d.decision === "allow" || d.decision === "deny") return d.decision;
+      if (d.decision === "ask") return "timeout";
     } catch {
       return "unavailable";
     }
   }
+  await postAnswer(permId, "ask", "timeout");
   return "timeout";
 }
 
+/**
+ * PermissionRequest hook (desktop / CLI sessions). The CLI runs this CONCURRENTLY with the
+ * desktop app's own permission dialog and takes whichever answers first, so: register the
+ * question on the phone (or attach to the card the dangerous-command hook already opened),
+ * wait for the tap, and return the decision. If the desk answers first the CLI discards us.
+ * No output = no opinion (the dialog just stays up).
+ */
+async function permissionRequest(payload) {
+  const tool = payload.tool_name || "";
+  const input = payload.tool_input || {};
+  let permId;
+  try {
+    const r = await fetch(BASE + "/api/perm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: payload.session_id || "",
+        cwd: payload.cwd || "",
+        tool_name: tool,
+        tool_input: input,
+        reason: "",
+        event: "PermissionRequest",
+      }),
+    });
+    if (!r.ok) process.exit(0);
+    const d = await r.json();
+    permId = d.perm_id;
+    if (!permId) process.exit(0);
+  } catch {
+    process.exit(0);
+  }
+  const deadline = Date.now() + WAIT_TOTAL_MS;
+  while (Date.now() < deadline) {
+    let d;
+    try {
+      const r = await fetch(BASE + "/api/perm/" + permId);
+      if (!r.ok) process.exit(0);
+      d = await r.json();
+    } catch {
+      process.exit(0);
+    }
+    if (d.decision === "allow" || d.decision === "deny") {
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "PermissionRequest",
+            decision:
+              d.decision === "allow"
+                ? { behavior: "allow" }
+                : { behavior: "deny", message: "使用者在手機上拒絕了這個動作。不要重試同一個動作；換個做法或說明原因後停下來。" },
+          },
+        })
+      );
+      process.exit(0);
+    }
+    if (d.decision === "ask") process.exit(0);
+  }
+  await postAnswer(permId, "ask", "timeout");
+  process.exit(0);
+}
+
 async function main() {
-  if (!RUN_ID) process.exit(0);
   let payload;
   try {
     payload = JSON.parse(await readStdin());
   } catch {
     process.exit(0);
   }
+  if (payload.hook_event_name === "PermissionRequest") {
+    if (RUN_ID) process.exit(0); // 手機發起的 run 由 PreToolUse 那條處理，不重複問
+    await permissionRequest(payload);
+    return;
+  }
+  if (!RUN_ID) process.exit(0);
   const tool = payload.tool_name || "";
   if (AUTO_ALLOW.has(tool)) {
     reply("allow", "claude-chat 內建通道");

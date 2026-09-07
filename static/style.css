@@ -237,6 +237,12 @@ body {
 }
 .tag.live { background: var(--live-bg); color: var(--live-text); }
 .tag.phone { background: transparent; color: var(--dim); border: 1px dashed var(--line); }
+.tag.perm { background: var(--bad); color: #fff; font-weight: 600; }
+.perm-banner {
+  margin: 6px 12px 2px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.4;
+  background: var(--bad); color: #fff; cursor: pointer;
+}
+.perm-banner span { text-decoration: underline; margin-left: 4px; }
 .perm-card .perm-btns { display: flex; gap: 8px; margin: 6px 0; }
 .perm-card .perm-btns .ask-opt { flex: 1; text-align: center; margin: 0; }
 .perm-card .perm-deny { border-color: var(--bad); }

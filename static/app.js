@@ -207,12 +207,32 @@ async function api(path, opts) {
 }
 
 /* ---------- 聊天室清單 ---------- */
+/* 桌面 session 在等授權的卡（hook 丟過來的），清單頂端提示 */
+let pendingPerms = [];
+function renderPermBanner() {
+  let bar = $("#perm-banner");
+  if (!pendingPerms.length) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "perm-banner";
+    bar.className = "perm-banner";
+    listEl.parentNode.insertBefore(bar, listEl);
+  }
+  const p = pendingPerms[0];
+  const room = rooms.find((r) => (r.gen_sids || [r.sid]).includes(p.sid));
+  bar.innerHTML = "⚠️ " + (pendingPerms.length > 1 ? pendingPerms.length + " 個對話" : "「" + esc(room ? room.title : "某個對話") + "」") +
+    "在等你授權危險指令 <span>點這裡去按</span>";
+  bar.onclick = () => { if (room) openRoom(room); };
+}
+
 async function loadRooms(silent) {
   try {
     const data = await api("/api/rooms" + (showAll() ? "?all=1" : ""));
     rooms = data.rooms;
+    pendingPerms = data.pending_perms || [];
     renderChips();
     renderRooms();
+    renderPermBanner();
   } catch (e) {
     if (!silent) listEl.innerHTML = '<div class="empty-hint">連不上伺服器：' + esc(e.message) + "</div>";
   }
@@ -297,6 +317,7 @@ function renderRooms() {
           (r.archived ? '<span class="tag arch">封存</span>' : "") +
           (r.live ? '<span class="tag live">桌機開著</span>' : "") +
           (eng === "claude" && r.app && !r.desktop ? '<span class="tag phone">只在手機</span>' : "") +
+          (r.perm ? '<span class="tag perm">⚠ 等你授權</span>' : "") +
         "</div>" +
       "</div>";
     const wrap = document.createElement("div");
@@ -503,6 +524,10 @@ function startWatch() {
     }
     watchOffset = d.offset;
     if (d.items && d.items.length) applyTailItems(d.items);
+    for (const p of d.pending || []) {
+      if (!msgsEl.querySelector('.perm-card[data-perm-id="' + p.perm_id + '"]')) { hideTyping(); renderPermCard(p); scrollBottom(); }
+    }
+    for (const p of d.answered || []) lockPermCard(p.perm_id, permNote(p.answer, p.by));
     if (d.busy !== watchBusy) {
       watchBusy = d.busy;
       if (d.busy) { setSub("桌面工作中…"); showTyping(); scrollBottom(); }
@@ -778,7 +803,7 @@ function attachRun(runId, from, isReattach) {
       return;
     }
     if (it.kind === "perm_done") {
-      lockPermCard(it.perm_id, it.decision === "allow" ? "已允許" : "已拒絕");
+      lockPermCard(it.perm_id, permNote(it.decision, it.by));
       return;
     }
     if (it.kind === "tool_ok") {
@@ -938,13 +963,24 @@ function lockAskCard(askId, note) {
   }
 }
 
-/* ---------- 逐項授權卡（先問我模式） ---------- */
+/* ---------- 逐項授權卡（先問我模式／危險指令，桌面 session 的也會出現在這） ---------- */
+function permNote(decision, by) {
+  const who = by === "desktop" ? "已在桌面按了：" : by === "timeout" ? "沒人按，改由桌面 App 自己問：" : "";
+  if (decision === "allow") return who + "已允許";
+  if (decision === "deny") return who + "已拒絕";
+  if (decision === "ask") return "太久沒人按，改由桌面 App 的確認框處理";
+  return who || null;
+}
+
 function renderPermCard(it) {
   const card = document.createElement("div");
   card.className = "msg ai ask-card perm-card";
   card.dataset.permId = it.perm_id;
+  const head = it.reason
+    ? (it.source === "desktop" ? "⚠️ 桌面正在跑的對話碰到危險指令，要放行嗎？（桌面也跳了同一個框，先按的算數）" : "⚠️ 危險指令，要放行嗎？")
+    : "🔐 它想做這件事，可以嗎？";
   card.innerHTML =
-    '<div class="ask-head">' + (it.reason ? "⚠️ 危險指令，要放行嗎？" : "🔐 它想做這件事，可以嗎？") + "</div>" +
+    '<div class="ask-head">' + head + "</div>" +
     (it.reason ? '<div class="perm-reason">' + esc(it.reason) + "</div>" : "") +
     '<div class="ask-tag">' + esc(it.tool || "工具") + "</div>" +
     (it.detail ? '<div class="ask-question">' + esc(it.detail) + "</div>" : "") +

@@ -217,6 +217,19 @@ Claude Code's default permission mode has no UI under `-p`, so every tool that n
 2. Before Claude runs one of those tools, the hook POSTs it to `/api/perm` and the phone shows a card with the command / file / URL and three buttons: **Allow**, **Deny**, and **Allow everything for the rest of this run**.
 3. Your tap is returned as the hook's `permissionDecision`.
 
+**Approving the desktop app's own prompts from the phone.** For a session running inside the Claude desktop app, the CLI runs `PermissionRequest` hooks *concurrently* with the app's permission dialog and takes whichever answers first (the loser is cancelled: the dialog closes by itself, or the hook is discarded). Register `perm-bridge.js` as a `PermissionRequest` hook in `~/.claude/settings.json` and every such prompt also shows up on the phone — a red banner on the room list, a card inside the room — and stays there (up to an hour) until someone answers on either side:
+
+```json
+{
+  "matcher": "Bash",
+  "hooks": [
+    { "type": "command", "command": "node \"/path/to/perm-bridge.js\"", "timeout": 600 }
+  ]
+}
+```
+
+Hooks are read when a session starts, so sessions already open keep the old behaviour until restarted. When the desk answers first the server notices the tool result in the transcript and locks the phone card as "answered on the desktop". Verified on Claude Code 2.1.258/2.1.260 with `--permission-prompt-tool stdio` (the desktop app's transport); the concurrency is undocumented, so a future CLI may change it.
+
 `perm-bridge.js` also works as a library. If you already have a PreToolUse hook that answers `ask` for dangerous commands (a `rm -rf` / `git push --force` guard, say), that `ask` silently becomes a deny under `-p`, so the phone can never approve it. Have the hook `require("/path/to/perm-bridge.js").askPhone({ tool_name, tool_input, reason })` when `CLAUDE_CHAT_RUN_ID` is set: it resolves to `allow` / `deny` / `timeout` / `unavailable`, the phone shows the `reason` in a red warning block, and the hook can answer accordingly (fall back to `ask` on `unavailable`). Give that hook a generous `timeout` (600 s) in `settings.json` so it can wait for you. No answer within ~9.5 minutes counts as a deny, and Claude is told to explain where it stopped rather than retry. Read-only tools (Read, Grep, Glob…) never ask.
 
 ### Troubleshooting

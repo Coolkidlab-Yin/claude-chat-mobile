@@ -971,8 +971,10 @@ def scan_rooms(show_all=False):
         rooms.append(extra)
 
     titles = load_titles()
+    perm_sids = {p["sid"] for p in pending_perms()}
     for room in rooms:
         room["running"] = room["sid"] in BY_SESSION
+        room["perm"] = any(x in perm_sids for x in (room.get("gen_sids") or [room["sid"]]))
         t = titles.get(room["sid"])
         if t:
             room["title"] = t
@@ -2003,7 +2005,7 @@ def serve_file(path: str):
 
 @app.get("/api/rooms")
 def rooms(all: int = 0):
-    return {"rooms": scan_rooms(show_all=bool(all))}
+    return {"rooms": scan_rooms(show_all=bool(all)), "pending_perms": pending_perms()}
 
 
 @app.get("/api/projects")
@@ -2086,7 +2088,8 @@ def tail(slug: str, sid: str, offset: int = 0):
         return {"items": [], "offset": offset, "busy": False, "live": False}
     items, new_off = tail_items(f, max(0, offset))
     return {"items": items, "offset": new_off, "busy": _room_busy(f),
-            "live": live_peer_for(sid) is not None, "running": sid in BY_SESSION}
+            "live": live_peer_for(sid) is not None, "running": sid in BY_SESSION,
+            "pending": pending_perms(sid), "answered": pending_perms(sid, answered=True)}
 
 
 def _ctx_window(model, tokens):
@@ -2452,32 +2455,110 @@ def search(q: str = "", all: int = 0):
     return {"q": q, "rooms": out}
 
 
-# ---------- 逐項授權（先問我模式） ----------
-PERMS = {}  # perm_id -> {"run_id", "tool", "input", "answer", "created"}
+# ---------- 逐項授權（先問我模式 ＋ 桌面 session 的危險指令也能在手機按） ----------
+PERMS = {}  # perm_id -> {"run_id"|None, "sid", "tool", "detail", "preview", "reason", "answer", "created"}
+PERM_TTL = 60 * 60          # 沒人理的授權卡幾秒後不再列出（hook 那邊最多等 55 分鐘）
 
 
 class PermBody(BaseModel):
-    run_id: str
+    run_id: str = ""
+    session_id: str = ""   # 桌面／CLI 的 run 帶這個（hook stdin 的 session_id），run_id 留空
+    cwd: str = ""
     tool_name: str = ""
     tool_input: dict = {}
     reason: str = ""   # 例如危險指令攔截 hook 給的說明，卡片上會用警示樣式顯示
+    notify_only: bool = False   # 桌面 session 的 PreToolUse 危險指令 hook：只登記卡片（它自己回 ask 讓桌面 app 跳框）
+    event: str = ""             # "PermissionRequest" = 與桌面確認框並行的 hook，會等手機答案；同一題會接上既有卡片
 
 
 class PermAnswerBody(BaseModel):
-    decision: str = "deny"   # allow / deny / allow_all
+    decision: str = "deny"   # allow / deny / allow_all / ask（hook 逾時，改回桌面 app 自己問）
+    by: str = ""             # phone（預設）/ desktop（桌面原生確認框先按了）/ timeout
+
+
+def _perm_card(perm_id, p):
+    return {"kind": "perm", "perm_id": perm_id, "tool": p["tool"], "detail": p["detail"],
+            "preview": p["preview"], "reason": p["reason"], "sid": p.get("sid"),
+            "source": "desktop" if p.get("run_id") is None else "phone", "created": p["created"],
+            "answer": p.get("answer"), "by": p.get("by") or ""}
+
+
+def _desktop_answered(p):
+    """桌面那邊先按了（確認框關掉、指令跑了或被拒）→ 從 jsonl 找到這個 tool_use 有沒有 tool_result。"""
+    sid, cmd = p.get("sid"), p.get("command")
+    if not sid or not cmd:
+        return None
+    g = list(PROJECTS_DIR.glob(f"*/{sid}.jsonl"))
+    if not g:
+        return None
+    try:
+        size = g[0].stat().st_size
+        with open(g[0], "rb") as f:
+            f.seek(max(0, size - 256 * 1024))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    use_id = None
+    for line in lines:
+        rec = _loads(line)
+        if not rec:
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if rec.get("type") == "assistant" and b.get("type") == "tool_use" and (b.get("input") or {}).get("command") == cmd:
+                use_id = b.get("id")
+            elif use_id and rec.get("type") == "user" and b.get("type") == "tool_result" and b.get("tool_use_id") == use_id:
+                txt = str(b.get("content"))[:200].lower()
+                return "deny" if ("denied" in txt or "拒絕" in txt or b.get("is_error")) else "allow"
+    return None
+
+
+def pending_perms(sid=None, answered=False):
+    """桌面 session 的授權卡：預設列還沒回答的（清單標記＋旁觀模式）；answered=True 列最近已回答的（讓手機把卡鎖起來）。"""
+    now = time.time()
+    out = []
+    for pid, p in list(PERMS.items()):
+        if now - p["created"] > PERM_TTL:
+            PERMS.pop(pid, None)
+            continue
+        if p["answer"] is None and p.get("run_id") is None and now - p["created"] > 3 and now - p.get("checked", 0) > 2:
+            p["checked"] = now
+            d = _desktop_answered(p)
+            if d:
+                p["answer"], p["by"] = d, "desktop"
+        if p.get("run_id") or (p["answer"] is not None) != answered:
+            continue
+        if sid and p.get("sid") != sid:
+            continue
+        out.append(_perm_card(pid, p))
+    return out
 
 
 @app.post("/api/perm")
 async def perm_open(body: PermBody):
-    run = RUNS.get(body.run_id)
-    if not run or run.done:
-        raise HTTPException(404, "這個工作已經結束")
-    if run.allow_all:
-        return {"perm_id": None, "decision": "allow"}
+    run = RUNS.get(body.run_id) if body.run_id else None
+    if body.run_id:
+        if not run or run.done:
+            raise HTTPException(404, "這個工作已經結束")
+        if run.allow_all:
+            return {"perm_id": None, "decision": "allow"}
+    else:
+        if not _safe_name(body.session_id, r"[A-Za-z0-9-]+"):
+            raise HTTPException(400, "缺 session_id")
+        if body.event == "PermissionRequest":
+            # 危險指令 hook 可能已經替同一題開了卡（帶 reason）→ 接上它，不要開第二張
+            cmd = (body.tool_input or {}).get("command") if isinstance(body.tool_input, dict) else None
+            for pid, p in PERMS.items():
+                if (p.get("sid") == body.session_id and p["answer"] is None and p.get("run_id") is None
+                        and p["tool"] == body.tool_name and (not cmd or p.get("command") == cmd)):
+                    p["notify_only"] = False
+                    return {"perm_id": pid}
     perm_id = uuid.uuid4().hex[:12]
     detail = _tool_detail(body.tool_name, body.tool_input)
-    PERMS[perm_id] = {"run_id": body.run_id, "tool": body.tool_name, "answer": None,
-                      "created": time.time()}
     preview = ""
     if isinstance(body.tool_input, dict):
         for k in ("command", "content", "new_string", "url"):
@@ -2485,8 +2566,19 @@ async def perm_open(body: PermBody):
             if isinstance(v, str) and v.strip():
                 preview = v[:600]
                 break
-    await _emit(run, {"kind": "perm", "perm_id": perm_id, "tool": body.tool_name,
-                      "detail": detail, "preview": preview, "reason": (body.reason or "")[:800]})
+    PERMS[perm_id] = {"run_id": body.run_id or None, "sid": body.session_id or (run.sid if run else None),
+                      "tool": body.tool_name, "detail": detail, "preview": preview,
+                      "reason": (body.reason or "")[:800], "answer": None, "by": "", "created": time.time(),
+                      "notify_only": bool(body.notify_only), "cwd": body.cwd or "",
+                      "command": (body.tool_input or {}).get("command") if isinstance(body.tool_input, dict) else None}
+    card = _perm_card(perm_id, PERMS[perm_id])
+    if run:
+        await _emit(run, card)
+    else:
+        # 桌面 session：這個房若剛好有手機端的工作在跑（直送模式），也塞進它的事件流
+        rid = BY_SESSION.get(body.session_id)
+        if rid and rid in RUNS and not RUNS[rid].done:
+            await _emit(RUNS[rid], card)
     return {"perm_id": perm_id}
 
 
@@ -2498,11 +2590,12 @@ async def perm_poll(perm_id: str):
     for _ in range(40):
         if p["answer"] is not None:
             return {"decision": p["answer"]}
-        run = RUNS.get(p["run_id"])
-        if not run or run.done:
-            return {"decision": "deny", "reason": "run_ended"}
-        if run.allow_all:
-            return {"decision": "allow"}
+        if p.get("run_id"):
+            run = RUNS.get(p["run_id"])
+            if not run or run.done:
+                return {"decision": "deny", "reason": "run_ended"}
+            if run.allow_all:
+                return {"decision": "allow"}
         await asyncio.sleep(0.5)
     return {"pending": True}
 
@@ -2512,16 +2605,17 @@ async def perm_answer(perm_id: str, body: PermAnswerBody):
     p = PERMS.get(perm_id)
     if not p:
         raise HTTPException(404, "沒有這筆授權")
-    if body.decision not in ("allow", "deny", "allow_all"):
-        raise HTTPException(400, "decision 只能是 allow / deny / allow_all")
+    if body.decision not in ("allow", "deny", "allow_all", "ask"):
+        raise HTTPException(400, "decision 只能是 allow / deny / allow_all / ask")
     if p["answer"] is not None:
         return {"ok": True, "already": True}
-    run = RUNS.get(p["run_id"])
+    run = RUNS.get(p["run_id"]) if p.get("run_id") else None
     if body.decision == "allow_all" and run:
         run.allow_all = True
     p["answer"] = "allow" if body.decision == "allow_all" else body.decision
+    p["by"] = body.by if body.by in ("desktop", "timeout") else "phone"
     if run:
-        await _emit(run, {"kind": "perm_done", "perm_id": perm_id, "decision": p["answer"]})
+        await _emit(run, {"kind": "perm_done", "perm_id": perm_id, "decision": p["answer"], "by": p["by"]})
     return {"ok": True}
 
 
