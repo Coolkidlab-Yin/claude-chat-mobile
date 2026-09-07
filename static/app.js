@@ -989,7 +989,7 @@ function renderPermCard(it) {
       '<button class="ask-opt perm-allow"><b>允許</b></button>' +
       '<button class="ask-opt perm-deny"><b>拒絕</b></button>' +
     "</div>" +
-    '<button class="ask-skip perm-all">這次工作剩下的全部允許（不再問）</button>';
+    (it.source === "desktop" ? "" : '<button class="ask-skip perm-all">這次工作剩下的全部允許（不再問）</button>');
   const submit = (decision) => {
     api("/api/perm/" + it.perm_id + "/answer", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -999,7 +999,8 @@ function renderPermCard(it) {
   };
   card.querySelector(".perm-allow").onclick = () => submit("allow");
   card.querySelector(".perm-deny").onclick = () => submit("deny");
-  card.querySelector(".perm-all").onclick = () => submit("allow_all");
+  const allBtn = card.querySelector(".perm-all");
+  if (allBtn) allBtn.onclick = () => submit("allow_all");
   msgsEl.appendChild(card);
 }
 
