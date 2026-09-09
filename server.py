@@ -1671,6 +1671,30 @@ def _from_mode_for(sid):
     return "bypass" if pm in ("bypassPermissions", "auto") else pm
 
 
+def _peer_frames(peer, sid, text, priority="next", msg_id=None):
+    """組一則要塞進桌面行程的 user 訊息（auth + user 兩個 frame）。
+    priority "now" = 打斷：收件端會 abort 目前的工具／確認框，模型收到 interrupt，這句變成下一輪。"""
+    me = "uds:" + _peer["sock"]
+    wrapped = (f'<cross-session-message from="{me}" from-name="{PEER_NAME}" '
+               f'from-mode="{_from_mode_for(sid)}">\n{text}\n</cross-session-message>')
+    return [
+        {"type": "auth", "token": peer["token"]},
+        {"msgV": 1, "msg_id": msg_id or str(uuid.uuid4()), "type": "user",
+         "message": {"role": "user", "content": wrapped},
+         "priority": priority, "from": me},
+    ]
+
+
+async def peer_interrupt(run, text):
+    """手機在桌面行程工作中插話：priority now = 先打斷再把這句排進去。"""
+    peer = getattr(run, "peer_info", None)
+    if not peer:
+        raise RuntimeError("這個工作沒有桌面通道")
+    await asyncio.to_thread(_pipe_send, peer["sock"], _peer_frames(peer, run.sid, text, "now"))
+    run.interrupted = True
+    run.ended_at_reset = True
+
+
 PEER_FIRST_WAIT = 90      # 桌面那邊多久沒開始回就當它在等核准
 PEER_IDLE_GAP = 2.5       # end_turn 之後再安靜幾秒才算做完
 PEER_MAX_TAIL = 45 * 60
@@ -1680,9 +1704,7 @@ async def run_peer(run, text, peer, path, fallback=None):
     """把訊息直送進桌面開著的那個行程，然後尾讀 jsonl 把它的回覆播到手機。
     pipe 開不起來（登記檔過期、行程剛死）→ 退回原本的 claude -p --resume（fallback=(mode, extra)）。"""
     msg_id = str(uuid.uuid4())
-    me = "uds:" + _peer["sock"]
-    wrapped = (f'<cross-session-message from="{me}" from-name="{PEER_NAME}" '
-               f'from-mode="{_from_mode_for(run.sid)}">\n{text}\n</cross-session-message>')
+    run.peer_info = peer
     fut = asyncio.get_event_loop().create_future()
     _peer["status"][msg_id] = fut
     try:
@@ -1692,12 +1714,7 @@ async def run_peer(run, text, peer, path, fallback=None):
     await _emit(run, {"kind": "init", "sid": run.sid})
     try:
         try:
-            await asyncio.to_thread(_pipe_send, peer["sock"], [
-                {"type": "auth", "token": peer["token"]},
-                {"msgV": 1, "msg_id": msg_id, "type": "user",
-                 "message": {"role": "user", "content": wrapped},
-                 "priority": "next", "from": me},
-            ])
+            await asyncio.to_thread(_pipe_send, peer["sock"], _peer_frames(peer, run.sid, text, "next", msg_id))
         except OSError as e:
             # 登記檔還在但 pipe 已經不見（行程剛結束/卡死）→ 當作桌面沒開著，走原本的路
             log.warning("peer pipe unusable for %s (%s); falling back to claude -p", run.sid, e)
@@ -1775,6 +1792,11 @@ async def run_peer(run, text, peer, path, fallback=None):
                         else:
                             ended_at = None
             now = time.time()
+            if getattr(run, "ended_at_reset", False):
+                # 剛打斷／插話：舊的 end_turn 不算數，等新一輪
+                run.ended_at_reset = False
+                ended_at = None
+                last_change = now
             if ended_at and now - last_change >= PEER_IDLE_GAP:
                 await _emit(run, {"kind": "done", "ok": True, "sid": run.sid, "error": ""})
                 return
@@ -2624,7 +2646,8 @@ def status():
     running = {}
     for sid, rid in BY_SESSION.items():
         run = RUNS.get(rid)
-        running[sid] = {"run_id": rid, "n_events": len(run.events) if run else 0}
+        running[sid] = {"run_id": rid, "n_events": len(run.events) if run else 0,
+                        "peer": bool(run and getattr(run, "peer", False))}
     return {"running": running}
 
 
@@ -2647,6 +2670,15 @@ async def send(body: SendBody):
 
     if body.sid:
         if body.sid in BY_SESSION:
+            busy = RUNS.get(BY_SESSION[body.sid])
+            if busy and not busy.done and getattr(busy, "peer", False):
+                # 桌面行程工作中，手機插話：打斷目前動作、把這句排到最前面，手機繼續追同一條事件流
+                try:
+                    await peer_interrupt(busy, text)
+                except Exception as e:
+                    raise HTTPException(500, f"插話失敗：{e}")
+                await _emit(busy, {"kind": "note", "text": "已打斷桌面目前的動作並插話，等它回應…"})
+                return {"run_id": busy.id, "peer": True, "interrupted": True}
             raise HTTPException(409, "這個聊天室還在忙，等它回完")
         f = find_room_file(body.slug, body.sid)
         if engine == "codex":
@@ -2743,9 +2775,15 @@ async def stop_run(run_id: str):
     if not run or run.done:
         return {"ok": False, "error": "這個工作已經結束了"}
     if getattr(run, "peer", False):
-        # 直送桌面的工作：手機只是旁觀，停止＝不再追蹤（桌面那邊照常跑）
-        run.proc = "stop"
-        return {"ok": True}
+        # 直送桌面的工作：停止＝打斷桌面正在做的動作（等同桌面按 Esc），手機繼續看它怎麼收尾
+        try:
+            await peer_interrupt(run, "使用者從手機按了停止：立刻停下目前的動作，不要繼續，用一句話說明停在哪裡，然後等下一句指示。")
+        except Exception as e:
+            log.warning("peer interrupt failed: %s", e)
+            run.proc = "stop"
+            return {"ok": False, "error": f"打斷失敗，改為不再追蹤：{e}"}
+        await _emit(run, {"kind": "note", "text": "已打斷桌面正在做的動作，等它收尾…"})
+        return {"ok": True, "interrupted": True}
     if not run.proc:
         # API 引擎跑在 executor 裡，沒有可以殺的子行程
         return {"ok": False, "error": "這種對話停不下來，等它回完"}

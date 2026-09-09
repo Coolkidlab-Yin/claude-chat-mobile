@@ -520,7 +520,7 @@ function startWatch() {
       // 手機這邊起的工作（例如背景重連）→ 交給事件流
       const st = await api("/api/status").catch(() => null);
       const info = st && st.running[sid];
-      if (info) { attachRun(info.run_id, info.n_events, true); return; }
+      if (info) { attachRun(info.run_id, info.n_events, true, info.peer); return; }
     }
     watchOffset = d.offset;
     if (d.items && d.items.length) applyTailItems(d.items);
@@ -558,7 +558,7 @@ function openRoom(room, fromPop) {
       // 若這個房間有背景工作進行中 → 接上事件流；否則旁觀桌面那邊的進度
       api("/api/status").then((st) => {
         const info = st.running[current && current.sid];
-        if (info) attachRun(info.run_id, info.n_events, true);
+        if (info) attachRun(info.run_id, info.n_events, true, info.peer);
         else startWatch();
       }).catch(() => startWatch());
     });
@@ -720,7 +720,9 @@ $("#file-input").addEventListener("change", async (e) => {
 /* ---------- 送訊息與事件流 ---------- */
 async function sendMsg() {
   let text = inputEl.value.trim();
-  if ((!text && !attachments.length) || !current || activeRun) return;
+  if ((!text && !attachments.length) || !current) return;
+  if (activeRun && !activeRun.peer) return;
+  const interrupting = !!(activeRun && activeRun.peer);
   if (attachments.some((a) => a.uploading)) { sysNote("圖片還在上傳，等一下再送"); return; }
   const paths = attachments.map((a) => a.path).filter(Boolean);
   if (paths.length) {
@@ -752,20 +754,23 @@ async function sendMsg() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    attachRun(r.run_id, 0, false);
+    if (interrupting && activeRun && r.run_id === activeRun.id) return; // 插話：同一條事件流繼續看
+    attachRun(r.run_id, 0, false, r.peer);
   } catch (e) {
     hideTyping();
     sysNote("送不出去：" + e.message, true);
   }
 }
 
-function attachRun(runId, from, isReattach) {
+function attachRun(runId, from, isReattach, peer) {
   stopWatch();
   detachRun(true);
   const es = new EventSource("/api/run/" + runId + "/events?start=" + (from || 0));
-  activeRun = { id: runId, es };
-  setSub("Claude 工作中…");
-  $("#btn-send").classList.add("hidden");
+  activeRun = { id: runId, es, peer: !!peer };
+  setSub(peer ? "桌面工作中…（可直接打字插話）" : "Claude 工作中…");
+  // 直送桌面的工作：停止＝打斷桌面的動作；輸入框保持可用，送出＝打斷並插話
+  $("#btn-stop").textContent = peer ? "打斷" : "■";
+  $("#btn-send").classList.toggle("hidden", !peer);
   $("#btn-stop").classList.remove("hidden");
   if (isReattach) showTyping();
 
@@ -833,7 +838,7 @@ function attachRun(runId, from, isReattach) {
       try {
         const st = await api("/api/status");
         const still = current && current.sid && st.running[current.sid];
-        if (still && still.run_id === runId) attachRun(runId, 0, true);
+        if (still && still.run_id === runId) attachRun(runId, 0, true, still.peer);
         else finishRun({ ok: true });
       } catch (e) { finishRun({ ok: false, error: "連線中斷" }); }
     }, 1500);
@@ -1028,8 +1033,12 @@ function sysNote(text, isErr) {
 $("#btn-send").onclick = sendMsg;
 $("#btn-stop").onclick = async () => {
   if (!activeRun) return;
-  try { await api("/api/run/" + activeRun.id + "/stop", { method: "POST" }); } catch (e) { /* ignore */ }
-  sysNote("已請它停下");
+  const peer = activeRun.peer;
+  try {
+    const r = await api("/api/run/" + activeRun.id + "/stop", { method: "POST" });
+    if (!peer) sysNote("已請它停下");
+    else if (r && r.ok === false) sysNote(r.error || "打斷失敗", true);
+  } catch (e) { sysNote("停不下來：" + e.message, true); }
 };
 
 /* ---------- 輸入框 ---------- */
@@ -1369,7 +1378,7 @@ document.addEventListener("visibilitychange", () => {
     if (current && current.sid && !activeRun) {
       api("/api/status").then((st) => {
         const info = st.running[current.sid];
-        if (info) attachRun(info.run_id, info.n_events, true);
+        if (info) attachRun(info.run_id, info.n_events, true, info.peer);
         else loadHistory().then(() => startWatch()).catch(() => {});
       }).catch(() => {});
     }
