@@ -220,8 +220,9 @@ function renderPermBanner() {
   }
   const p = pendingPerms[0];
   const room = rooms.find((r) => (r.gen_sids || [r.sid]).includes(p.sid));
-  bar.innerHTML = "⚠️ " + (pendingPerms.length > 1 ? pendingPerms.length + " 個對話" : "「" + esc(room ? room.title : "某個對話") + "」") +
-    "在等你授權危險指令 <span>點這裡去按</span>";
+  const isAsk = p.tool === "AskUserQuestion";
+  bar.innerHTML = (isAsk ? "🙋 " : "⚠️ ") + (pendingPerms.length > 1 ? pendingPerms.length + " 個對話" : "「" + esc(room ? room.title : "某個對話") + "」") +
+    (isAsk ? "在等你回答問題" : "在等你授權危險指令") + " <span>點這裡去按</span>";
   bar.onclick = () => { if (room) openRoom(room); };
 }
 
@@ -318,6 +319,7 @@ function renderRooms() {
           (r.live ? '<span class="tag live">桌機開著</span>' : "") +
           (eng === "claude" && r.app && !r.desktop ? '<span class="tag phone">只在手機</span>' : "") +
           (r.perm ? '<span class="tag perm">⚠ 等你授權</span>' : "") +
+          (r.ask ? '<span class="tag perm">🙋 等你回答</span>' : "") +
         "</div>" +
       "</div>";
     const wrap = document.createElement("div");
@@ -527,7 +529,7 @@ function startWatch() {
     for (const p of d.pending || []) {
       if (!msgsEl.querySelector('.perm-card[data-perm-id="' + p.perm_id + '"]')) { hideTyping(); renderPermCard(p); scrollBottom(); }
     }
-    for (const p of d.answered || []) lockPermCard(p.perm_id, permNote(p.answer, p.by));
+    for (const p of d.answered || []) lockPermCard(p.perm_id, permNote(p.answer, p.by, p.tool));
     if (d.busy !== watchBusy) {
       watchBusy = d.busy;
       if (d.busy) { setSub("桌面工作中…"); showTyping(); scrollBottom(); }
@@ -808,7 +810,7 @@ function attachRun(runId, from, isReattach, peer) {
       return;
     }
     if (it.kind === "perm_done") {
-      lockPermCard(it.perm_id, permNote(it.decision, it.by));
+      lockPermCard(it.perm_id, permNote(it.decision, it.by, it.tool));
       return;
     }
     if (it.kind === "tool_ok") {
@@ -878,13 +880,26 @@ async function finishRun(doneEv) {
 
 /* ---------- AskUserQuestion 選項卡 ---------- */
 function renderAskCard(it) {
+  const card = buildAskCard(it.questions, "🙋 它想問你", (answers, freeText, skipped) => {
+    api("/api/ask/" + it.ask_id + "/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: answers || {}, free_text: freeText || "", skipped: !!skipped }),
+    }).catch(() => {});
+    lockAskCard(it.ask_id, skipped ? "（已跳過）" : null);
+  });
+  card.dataset.askId = it.ask_id;
+  msgsEl.appendChild(card);
+}
+
+/* 選項卡本體：questions 依 AskUserQuestion 格式；submit(answers, freeText, skipped) */
+function buildAskCard(questions, head, submit) {
   const card = document.createElement("div");
   card.className = "msg ai ask-card";
-  card.dataset.askId = it.ask_id;
   const picked = {};   // question -> Set(labels)
 
-  let html = '<div class="ask-head">🙋 它想問你</div>';
-  for (const q of it.questions || []) {
+  let html = '<div class="ask-head">' + head + "</div>";
+  for (const q of questions || []) {
     const multi = !!q.multiSelect;
     html += '<div class="ask-q" data-q="' + esc(q.question) + '" data-multi="' + (multi ? 1 : 0) + '">';
     if (q.header) html += '<div class="ask-tag">' + esc(q.header) + "</div>";
@@ -902,15 +917,6 @@ function renderAskCard(it) {
     '<button class="ask-send">送出</button></div>' +
     '<button class="ask-skip">跳過，讓它自己決定</button>';
   card.innerHTML = html;
-
-  const submit = (answers, freeText, skipped) => {
-    api("/api/ask/" + it.ask_id + "/answer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ answers: answers || {}, free_text: freeText || "", skipped: !!skipped }),
-    }).catch(() => {});
-    lockAskCard(it.ask_id, skipped ? "（已跳過）" : null);
-  };
 
   card.querySelectorAll(".ask-q").forEach((qEl) => {
     const qText = qEl.dataset.q;
@@ -951,8 +957,7 @@ function renderAskCard(it) {
     submit(answers, v, false);
   };
   card.querySelector(".ask-skip").onclick = () => submit({}, "", true);
-
-  msgsEl.appendChild(card);
+  return card;
 }
 
 function lockAskCard(askId, note) {
@@ -969,7 +974,12 @@ function lockAskCard(askId, note) {
 }
 
 /* ---------- 逐項授權卡（先問我模式／危險指令，桌面 session 的也會出現在這） ---------- */
-function permNote(decision, by) {
+function permNote(decision, by, tool) {
+  if (tool === "AskUserQuestion") {
+    if (by === "desktop") return "已在桌面回答了";
+    if (by === "timeout" || decision === "ask") return "太久沒人答，改由桌面 App 自己問";
+    return decision === "deny" ? "（已跳過）" : "已回答";
+  }
   const who = by === "desktop" ? "已在桌面按了：" : by === "timeout" ? "沒人按，改由桌面 App 自己問：" : "";
   if (decision === "allow") return who + "已允許";
   if (decision === "deny") return who + "已拒絕";
@@ -978,6 +988,20 @@ function permNote(decision, by) {
 }
 
 function renderPermCard(it) {
+  if (it.tool === "AskUserQuestion" && it.questions) {
+    // 桌面正在跑的對話問選擇題：桌面 App 也跳了同一題，先答的算數；答案走授權通道回填
+    const qc = buildAskCard(it.questions, "🙋 桌面的對話想問你（桌面也跳了同一題，先答的算數）", (answers, freeText, skipped) => {
+      api("/api/perm/" + it.perm_id + "/answer", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: skipped ? "deny" : "allow", answers: answers || {}, free_text: freeText || "" }),
+      }).catch(() => {});
+      lockPermCard(it.perm_id, skipped ? "（已跳過）" : "已回答");
+    });
+    qc.classList.add("perm-card");
+    qc.dataset.permId = it.perm_id;
+    msgsEl.appendChild(qc);
+    return;
+  }
   const card = document.createElement("div");
   card.className = "msg ai ask-card perm-card";
   card.dataset.permId = it.perm_id;
@@ -1013,7 +1037,7 @@ function lockPermCard(permId, note) {
   const card = msgsEl.querySelector('.perm-card[data-perm-id="' + permId + '"]');
   if (!card || card.classList.contains("done")) return;
   card.classList.add("done");
-  card.querySelectorAll("button").forEach((el) => { el.disabled = true; });
+  card.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
   if (note) {
     const n = document.createElement("div");
     n.className = "ask-note";

@@ -221,12 +221,14 @@ Claude Code's default permission mode has no UI under `-p`, so every tool that n
 
 ```json
 {
-  "matcher": "Bash",
+  "matcher": "Bash|AskUserQuestion",
   "hooks": [
     { "type": "command", "command": "node \"/path/to/perm-bridge.js\"", "timeout": 600 }
   ]
 }
 ```
+
+The same hook also answers the desktop app's **multiple-choice questions** (`AskUserQuestion`): the app itself answers those through the permission dialog by echoing the tool input back with an `answers` map (question text → chosen label), so the bridge does the same thing with what you tap on the phone (`allow` + `updatedInput.answers`; "skip" becomes a deny that tells Claude to decide on its own). The phone shows the familiar option card, the room list gets a "waiting for your answer" tag, and whichever side answers first wins.
 
 Hooks are read when a session starts, so sessions already open keep the old behaviour until restarted. When the desk answers first the server notices the tool result in the transcript and locks the phone card as "answered on the desktop". Verified on Claude Code 2.1.258/2.1.260 with `--permission-prompt-tool stdio` (the desktop app's transport); the concurrency is undocumented, so a future CLI may change it.
 

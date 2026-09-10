@@ -971,10 +971,13 @@ def scan_rooms(show_all=False):
         rooms.append(extra)
 
     titles = load_titles()
-    perm_sids = {p["sid"] for p in pending_perms()}
+    _pp = pending_perms()
+    perm_sids = {p["sid"] for p in _pp if p["tool"] != "AskUserQuestion"}
+    ask_sids = {p["sid"] for p in _pp if p["tool"] == "AskUserQuestion"}
     for room in rooms:
         room["running"] = room["sid"] in BY_SESSION
         room["perm"] = any(x in perm_sids for x in (room.get("gen_sids") or [room["sid"]]))
+        room["ask"] = any(x in ask_sids for x in (room.get("gen_sids") or [room["sid"]]))
         t = titles.get(room["sid"])
         if t:
             room["title"] = t
@@ -2496,13 +2499,27 @@ class PermBody(BaseModel):
 class PermAnswerBody(BaseModel):
     decision: str = "deny"   # allow / deny / allow_all / ask（hook 逾時，改回桌面 app 自己問）
     by: str = ""             # phone（預設）/ desktop（桌面原生確認框先按了）/ timeout
+    answers: dict = {}       # AskUserQuestion：問題文字 -> 選的答案（桌面版是靠確認框回填 answers 的，手機也走同一條）
+    free_text: str = ""      # AskUserQuestion：打字作答
 
 
 def _perm_card(perm_id, p):
     return {"kind": "perm", "perm_id": perm_id, "tool": p["tool"], "detail": p["detail"],
             "preview": p["preview"], "reason": p["reason"], "sid": p.get("sid"),
             "source": "desktop" if p.get("run_id") is None else "phone", "created": p["created"],
-            "answer": p.get("answer"), "by": p.get("by") or ""}
+            "answer": p.get("answer"), "by": p.get("by") or "", "questions": p.get("questions")}
+
+
+def _perm_key(inp):
+    """拿來對「同一題」的鍵：Bash 用 command；AskUserQuestion 用第一題的問題文字。"""
+    if not isinstance(inp, dict):
+        return None
+    if isinstance(inp.get("command"), str):
+        return inp["command"]
+    qs = inp.get("questions")
+    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+        return qs[0].get("question")
+    return None
 
 
 def _desktop_answered(p):
@@ -2531,7 +2548,7 @@ def _desktop_answered(p):
         for b in content:
             if not isinstance(b, dict):
                 continue
-            if rec.get("type") == "assistant" and b.get("type") == "tool_use" and (b.get("input") or {}).get("command") == cmd:
+            if rec.get("type") == "assistant" and b.get("type") == "tool_use" and _perm_key(b.get("input")) == cmd:
                 use_id = b.get("id")
             elif use_id and rec.get("type") == "user" and b.get("type") == "tool_result" and b.get("tool_use_id") == use_id:
                 txt = str(b.get("content"))[:200].lower()
@@ -2573,7 +2590,7 @@ async def perm_open(body: PermBody):
             raise HTTPException(400, "缺 session_id")
         if body.event == "PermissionRequest":
             # 危險指令 hook 可能已經替同一題開了卡（帶 reason）→ 接上它，不要開第二張
-            cmd = (body.tool_input or {}).get("command") if isinstance(body.tool_input, dict) else None
+            cmd = _perm_key(body.tool_input)
             for pid, p in PERMS.items():
                 if (p.get("sid") == body.session_id and p["answer"] is None and p.get("run_id") is None
                         and p["tool"] == body.tool_name and (not cmd or p.get("command") == cmd)):
@@ -2592,7 +2609,9 @@ async def perm_open(body: PermBody):
                       "tool": body.tool_name, "detail": detail, "preview": preview,
                       "reason": (body.reason or "")[:800], "answer": None, "by": "", "created": time.time(),
                       "notify_only": bool(body.notify_only), "cwd": body.cwd or "",
-                      "command": (body.tool_input or {}).get("command") if isinstance(body.tool_input, dict) else None}
+                      "command": _perm_key(body.tool_input),
+                      "questions": (body.tool_input.get("questions") if body.tool_name == "AskUserQuestion"
+                                    and isinstance(body.tool_input, dict) else None)}
     card = _perm_card(perm_id, PERMS[perm_id])
     if run:
         await _emit(run, card)
@@ -2611,7 +2630,7 @@ async def perm_poll(perm_id: str):
         raise HTTPException(404, "沒有這筆授權")
     for _ in range(40):
         if p["answer"] is not None:
-            return {"decision": p["answer"]}
+            return {"decision": p["answer"], "answers": p.get("answers") or {}, "free_text": p.get("free_text") or ""}
         if p.get("run_id"):
             run = RUNS.get(p["run_id"])
             if not run or run.done:
@@ -2636,8 +2655,10 @@ async def perm_answer(perm_id: str, body: PermAnswerBody):
         run.allow_all = True
     p["answer"] = "allow" if body.decision == "allow_all" else body.decision
     p["by"] = body.by if body.by in ("desktop", "timeout") else "phone"
+    p["answers"] = {str(k)[:500]: str(v)[:500] for k, v in (body.answers or {}).items()}
+    p["free_text"] = (body.free_text or "")[:2000]
     if run:
-        await _emit(run, {"kind": "perm_done", "perm_id": perm_id, "decision": p["answer"], "by": p["by"]})
+        await _emit(run, {"kind": "perm_done", "perm_id": perm_id, "decision": p["answer"], "by": p["by"], "tool": p["tool"]})
     return {"ok": True}
 
 

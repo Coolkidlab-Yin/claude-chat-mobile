@@ -154,17 +154,24 @@ async function permissionRequest(payload) {
       process.exit(0);
     }
     if (d.decision === "allow" || d.decision === "deny") {
-      process.stdout.write(
-        JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: "PermissionRequest",
-            decision:
-              d.decision === "allow"
-                ? { behavior: "allow" }
-                : { behavior: "deny", message: "使用者在手機上拒絕了這個動作。不要重試同一個動作；換個做法或說明原因後停下來。" },
-          },
-        })
-      );
+      let decision;
+      if (tool === "AskUserQuestion") {
+        // 桌面 app 回答選擇題的方式就是在確認框裡把 answers 回填進工具輸入；手機答案走同一條
+        if (d.decision === "allow") {
+          const answers = Object.assign({}, d.answers || {});
+          const free = (d.free_text || "").trim();
+          if (free) for (const q of input.questions || []) if (!answers[q.question]) answers[q.question] = free;
+          decision = { behavior: "allow", updatedInput: Object.assign({}, input, { answers }) };
+        } else {
+          decision = { behavior: "deny", message: "使用者在手機上跳過了這個問題，請你自行判斷後繼續，不要再問同一題。" };
+        }
+      } else {
+        decision =
+          d.decision === "allow"
+            ? { behavior: "allow" }
+            : { behavior: "deny", message: "使用者在手機上拒絕了這個動作。不要重試同一個動作；換個做法或說明原因後停下來。" };
+      }
+      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision } }));
       process.exit(0);
     }
     if (d.decision === "ask") process.exit(0);
