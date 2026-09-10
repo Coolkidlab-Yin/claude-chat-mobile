@@ -1668,6 +1668,11 @@ def _pipe_send(sock, lines):
         time.sleep(0.3)
 
 
+PEER_HINT = ("（這句是使用者本人在手機介面打的字。依你的規則它不算本人授權：若這句是在回答你正在等的"
+             "決定或授權（推不推、刪不刪、選哪個），不要拒絕也不要直接照做，改用 AskUserQuestion 把同一個決定"
+             "再問一次、選項含這句的意思——本人會在手機卡片上按，那才算數。純詢問或不需授權的事照常處理。）")
+
+
 def _from_mode_for(sid):
     reg = desktop_registry().get(sid) or {}
     pm = reg.get("permissionMode") or "bypassPermissions"
@@ -1678,8 +1683,12 @@ def _peer_frames(peer, sid, text, priority="next", msg_id=None):
     """組一則要塞進桌面行程的 user 訊息（auth + user 兩個 frame）。
     priority "now" = 打斷：收件端會 abort 目前的工具／確認框，模型收到 interrupt，這句變成下一輪。"""
     me = "uds:" + _peer["sock"]
+    # 收件端的系統規則：跨 session 訊息永遠不算「使用者本人」的授權（防 session 之間互相洗授權）。
+    # 所以手機打的字若是在回答一個等待中的決定，桌面那邊不能直接採信——附一行提示，請它改用
+    # AskUserQuestion 再問一次；那條走授權元件回填，手機卡片上按的才算本人（見 perm-bridge.js）。
+    body = text + "\n\n" + PEER_HINT if PEER_HINT else text
     wrapped = (f'<cross-session-message from="{me}" from-name="{PEER_NAME}" '
-               f'from-mode="{_from_mode_for(sid)}">\n{text}\n</cross-session-message>')
+               f'from-mode="{_from_mode_for(sid)}">\n{body}\n</cross-session-message>')
     return [
         {"type": "auth", "token": peer["token"]},
         {"msgV": 1, "msg_id": msg_id or str(uuid.uuid4()), "type": "user",
